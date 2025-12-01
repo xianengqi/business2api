@@ -5,9 +5,11 @@
 # Data
 data/
 
-# Node modules (will be installed in Docker)
+# Node.js files (no longer needed - registration is pure Go)
 node_modules/
 package-lock.json
+package.json
+main.js
 
 # IDE
 .idea/

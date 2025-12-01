@@ -13,7 +13,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,13 +29,12 @@ import (
 // ==================== 配置结构 ====================
 
 type PoolConfig struct {
-	TargetCount          int    `json:"target_count"`           // 目标账号数量
-	MinCount             int    `json:"min_count"`              // 最小账号数，低于此值触发注册
-	CheckIntervalMinutes int    `json:"check_interval_minutes"` // 检查间隔(分钟)
-	RegisterThreads      int    `json:"register_threads"`       // 注册线程数
-	RegisterHeadless     bool   `json:"register_headless"`      // 无头模式
-	RegisterScript       string `json:"register_script"`        // 注册脚本路径
-	RefreshOnStartup     bool   `json:"refresh_on_startup"`     // 启动时刷新账号
+	TargetCount          int  `json:"target_count"`           // 目标账号数量
+	MinCount             int  `json:"min_count"`              // 最小账号数，低于此值触发注册
+	CheckIntervalMinutes int  `json:"check_interval_minutes"` // 检查间隔(分钟)
+	RegisterThreads      int  `json:"register_threads"`       // 注册线程数
+	RegisterHeadless     bool `json:"register_headless"`      // 无头模式
+	RefreshOnStartup     bool `json:"refresh_on_startup"`     // 启动时刷新账号
 }
 
 type AppConfig struct {
@@ -57,7 +55,6 @@ var appConfig = AppConfig{
 		CheckIntervalMinutes: 30,
 		RegisterThreads:      1,
 		RegisterHeadless:     true,
-		RegisterScript:       "./main.js",
 		RefreshOnStartup:     true,
 	},
 }
@@ -1055,6 +1052,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		session, err := createSession(jwt, configID, acc.Data.Authorization)
 		if err != nil {
 			log.Printf("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
+			// 401 错误标记账号需要刷新
+			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
+				pool.MarkNeedsRefresh(acc)
+			}
 			lastErr = err
 			continue
 		}
@@ -1591,6 +1592,27 @@ func apiKeyAuth() gin.HandlerFunc {
 }
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
+
+	// 解析命令行参数
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--debug", "-d":
+			RegisterDebug = true
+			log.Println("🔧 调试模式已启用，将保存截图到 data/screenshots/")
+		case "--once":
+			RegisterOnce = true
+			log.Println("🔧 单次运行模式")
+		case "--help", "-h":
+			fmt.Println(`用法: ./gemini-gateway [选项]
+
+选项:
+  --debug, -d    调试模式，保存注册过程截图
+  --once         单次注册模式（调试用）
+  --help, -h     显示帮助`)
+			os.Exit(0)
+		}
+	}
+
 	loadAppConfig()
 	initHTTPClient()
 	if err := pool.Load(DataDir); err != nil {
@@ -1607,25 +1629,16 @@ func main() {
 		log.Println("⚠️ 未配置 API Key，API 将无鉴权运行")
 	}
 
-	// 检查注册脚本
-	if appConfig.Pool.RegisterScript != "" {
-		scriptPath := appConfig.Pool.RegisterScript
-		if !filepath.IsAbs(scriptPath) {
-			scriptPath, _ = filepath.Abs(scriptPath)
-		}
-		if _, err := os.Stat(scriptPath); err != nil {
-			log.Printf("⚠️ 注册脚本不存在: %s", scriptPath)
-		}
-	}
+	// 启动号池管理
 	if appConfig.Pool.RefreshOnStartup {
 		pool.StartPoolManager()
 	}
-	if pool.TotalCount() == 0 && appConfig.Pool.RegisterScript != "" {
+	if pool.TotalCount() == 0 {
 		needCount := appConfig.Pool.TargetCount
 		log.Printf("📝 无账号，启动注册 %d 个...", needCount)
 		startRegister(needCount)
 	}
-	if appConfig.Pool.CheckIntervalMinutes > 0 && appConfig.Pool.RegisterScript != "" {
+	if appConfig.Pool.CheckIntervalMinutes > 0 {
 		go poolMaintainer()
 	}
 	gin.SetMode(gin.ReleaseMode)

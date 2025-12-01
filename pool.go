@@ -45,13 +45,14 @@ type Account struct {
 	ConfigID    string
 	CSESIDX     string
 	LastRefresh time.Time
+	LastUsed    time.Time // 最后使用时间
 	Refreshed   bool
 	mu          sync.Mutex
 }
 
 const (
 	refreshCooldown     = 4 * time.Minute
-	jwtRefreshThreshold = 60 * time.Second
+	idleRefreshInterval = 5 * time.Hour // 5小时未使用或未刷新则刷新
 )
 
 type AccountPool struct {
@@ -259,10 +260,10 @@ func (p *AccountPool) refreshWorker(id int) {
 }
 
 func (p *AccountPool) scanWorker() {
-	ticker := time.NewTicker(p.refreshInterval)
 	fileScanTicker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
+	idleRefreshTicker := time.NewTicker(30 * time.Minute) // 每30分钟检查一次未使用账号
 	defer fileScanTicker.Stop()
+	defer idleRefreshTicker.Stop()
 
 	for {
 		select {
@@ -270,14 +271,14 @@ func (p *AccountPool) scanWorker() {
 			return
 		case <-fileScanTicker.C:
 			p.Load(DataDir)
-		case <-ticker.C:
-			p.RefreshExpiredAccounts()
+		case <-idleRefreshTicker.C:
+			p.RefreshIdleAccounts()
 		}
 	}
 }
 
-// RefreshExpiredAccounts 刷新即将过期的账号
-func (p *AccountPool) RefreshExpiredAccounts() {
+// RefreshIdleAccounts 刷新5小时未使用或未刷新的账号
+func (p *AccountPool) RefreshIdleAccounts() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -287,14 +288,16 @@ func (p *AccountPool) RefreshExpiredAccounts() {
 
 	for _, acc := range p.readyAccounts {
 		acc.mu.Lock()
-		jwtExpires := acc.JWTExpires
 		lastRefresh := acc.LastRefresh
+		lastUsed := acc.LastUsed
 		acc.mu.Unlock()
 
-		needsRefresh := jwtExpires.IsZero() || now.Add(jwtRefreshThreshold).After(jwtExpires)
+		// 5小时未使用或未刷新
+		idleSinceRefresh := now.Sub(lastRefresh) >= idleRefreshInterval
+		idleSinceUse := lastUsed.IsZero() || now.Sub(lastUsed) >= idleRefreshInterval
 		inCooldown := now.Sub(lastRefresh) < refreshCooldown
 
-		if needsRefresh && !inCooldown {
+		if (idleSinceRefresh || idleSinceUse) && !inCooldown {
 			acc.mu.Lock()
 			acc.Refreshed = false
 			acc.mu.Unlock()
@@ -307,7 +310,7 @@ func (p *AccountPool) RefreshExpiredAccounts() {
 
 	p.readyAccounts = stillReady
 	if refreshed > 0 {
-		log.Printf("🔄 扫描刷新: %d 个账号JWT即将过期", refreshed)
+		log.Printf("🔄 空闲刷新: %d 个账号超过5小时未使用或未刷新", refreshed)
 	}
 }
 
@@ -337,24 +340,58 @@ func (p *AccountPool) RefreshAllAccounts() {
 
 func (p *AccountPool) Next() *Account {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	if len(p.readyAccounts) == 0 {
+		p.mu.RUnlock()
 		return nil
 	}
 
 	n := len(p.readyAccounts)
 	startIdx := atomic.AddUint64(&p.index, 1) - 1
+	var selectedAcc *Account
 	for i := 0; i < n; i++ {
 		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
 		acc.mu.Lock()
 		inCooldown := time.Since(acc.LastRefresh) < refreshCooldown
 		acc.mu.Unlock()
 		if !inCooldown {
-			return acc
+			selectedAcc = acc
+			break
 		}
 	}
-	return p.readyAccounts[startIdx%uint64(n)]
+	if selectedAcc == nil {
+		selectedAcc = p.readyAccounts[startIdx%uint64(n)]
+	}
+	p.mu.RUnlock()
+
+	// 取出账号时立即刷新
+	if selectedAcc != nil {
+		selectedAcc.mu.Lock()
+		selectedAcc.LastUsed = time.Now()
+		selectedAcc.mu.Unlock()
+
+		// 异步刷新JWT（不阻塞返回）
+		go func(acc *Account) {
+			acc.mu.Lock()
+			needsRefresh := time.Since(acc.LastRefresh) >= refreshCooldown
+			acc.mu.Unlock()
+
+			if needsRefresh {
+				if err := acc.RefreshJWT(); err != nil {
+					if !strings.Contains(err.Error(), "刷新冷却中") {
+						log.Printf("⚠️ [%s] 使用时刷新失败: %v", acc.Data.Email, err)
+					}
+				} else {
+					if err := acc.SaveToFile(); err != nil {
+						log.Printf("⚠️ [%s] 写回文件失败: %v", acc.Data.Email, err)
+					} else {
+						log.Printf("✅ [%s] 使用时刷新成功，已写回文件", acc.Data.Email)
+					}
+				}
+			}
+		}(selectedAcc)
+	}
+
+	return selectedAcc
 }
 
 func (p *AccountPool) Count() int { p.mu.RLock(); defer p.mu.RUnlock(); return len(p.readyAccounts) }
@@ -374,6 +411,38 @@ func (p *AccountPool) TotalCount() int {
 	return len(p.readyAccounts) + len(p.pendingAccounts)
 }
 
+// MarkNeedsRefresh 标记账号需要刷新（遇到 401 等认证错误时调用）
+func (p *AccountPool) MarkNeedsRefresh(acc *Account) {
+	if acc == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 从 ready 列表移除
+	for i, a := range p.readyAccounts {
+		if a == acc {
+			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
+			break
+		}
+	}
+
+	// 标记需要刷新并加入 pending
+	acc.mu.Lock()
+	acc.Refreshed = false
+	acc.JWTExpires = time.Time{}
+	acc.mu.Unlock()
+
+	// 检查是否已在 pending 中
+	for _, a := range p.pendingAccounts {
+		if a == acc {
+			return
+		}
+	}
+	p.pendingAccounts = append(p.pendingAccounts, acc)
+	log.Printf("⚠️ [%s] 已标记为需要刷新", acc.Data.Email)
+}
 
 func urlsafeB64Encode(data []byte) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(data), "=")

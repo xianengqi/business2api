@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p dist
           mv business2api-* dist/
-          cp main.js package.json config.json.example dist/
+          cp config.json.example dist/
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

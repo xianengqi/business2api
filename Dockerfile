@@ -21,12 +21,10 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Install runtime dependencies: ca-certificates, tzdata, nodejs, npm, chromium
+# Install runtime dependencies (Chromium for rod browser automation)
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
-    nodejs \
-    npm \
     chromium \
     nss \
     freetype \
@@ -34,19 +32,11 @@ RUN apk add --no-cache \
     ttf-freefont \
     font-noto-cjk
 
-# Set Puppeteer to use system Chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
-
 # Copy binary from builder
 COPY --from=builder /app/business2api .
 
-# Copy JS registration script and install dependencies
-COPY main.js package.json ./
-RUN npm install --production && npm cache clean --force
-
-# Copy config template (optional)
-COPY config.json.example ./config.json.example
+# Copy config template if exists
+COPY config.json.exampl[e] ./
 
 # Create data directory
 RUN mkdir -p /app/data
