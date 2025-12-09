@@ -48,6 +48,7 @@ type PoolConfig struct {
 	EnableBrowserRefresh   bool `json:"enable_browser_refresh"`    // 启用浏览器刷新401账号
 	BrowserRefreshHeadless bool `json:"browser_refresh_headless"`  // 浏览器刷新无头模式
 	BrowserRefreshMaxRetry int  `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
+	AutoDelete401          bool `json:"auto_delete_401"`           // 401时自动删除账号
 }
 
 // FlowConfig Flow 服务配置
@@ -102,24 +103,52 @@ var (
 // APIStats API 调用统计
 type APIStats struct {
 	mu              sync.RWMutex
-	startTime       time.Time   // 服务启动时间
-	totalRequests   int64       // 总请求数
-	successRequests int64       // 成功请求数
-	failedRequests  int64       // 失败请求数
-	inputTokens     int64       // 输入 tokens
-	outputTokens    int64       // 输出 tokens
-	imageGenerated  int64       // 生成的图片数
-	videoGenerated  int64       // 生成的视频数
-	requestTimes    []time.Time // 最近请求时间（用于计算 RPM）
+	startTime       time.Time              // 服务启动时间
+	totalRequests   int64                  // 总请求数
+	successRequests int64                  // 成功请求数
+	failedRequests  int64                  // 失败请求数
+	inputTokens     int64                  // 输入 tokens
+	outputTokens    int64                  // 输出 tokens
+	imageGenerated  int64                  // 生成的图片数
+	videoGenerated  int64                  // 生成的视频数
+	requestTimes    []time.Time            // 最近请求时间（用于计算 RPM）
+	modelStats      map[string]*ModelStats // 每个模型的统计
+	hourlyStats     [24]HourlyStats        // 24小时统计
+	lastHour        int                    // 上次记录的小时
+}
+
+// ModelStats 模型统计
+type ModelStats struct {
+	Requests     int64 `json:"requests"`
+	Success      int64 `json:"success"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	Images       int64 `json:"images"`
+}
+
+// HourlyStats 小时统计
+type HourlyStats struct {
+	Hour         int   `json:"hour"`
+	Requests     int64 `json:"requests"`
+	Success      int64 `json:"success"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
 }
 
 var apiStats = &APIStats{
 	startTime:    time.Now(),
 	requestTimes: make([]time.Time, 0, 1000),
+	modelStats:   make(map[string]*ModelStats),
+	lastHour:     time.Now().Hour(),
 }
 
 // RecordRequest 记录请求
 func (s *APIStats) RecordRequest(success bool, inputTokens, outputTokens, images, videos int64) {
+	s.RecordRequestWithModel("", success, inputTokens, outputTokens, images, videos)
+}
+
+// RecordRequestWithModel 记录请求（带模型）
+func (s *APIStats) RecordRequestWithModel(model string, success bool, inputTokens, outputTokens, images, videos int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -140,6 +169,36 @@ func (s *APIStats) RecordRequest(success bool, inputTokens, outputTokens, images
 	if len(s.requestTimes) > 1000 {
 		s.requestTimes = s.requestTimes[len(s.requestTimes)-1000:]
 	}
+
+	// 模型统计
+	if model != "" {
+		if s.modelStats[model] == nil {
+			s.modelStats[model] = &ModelStats{}
+		}
+		ms := s.modelStats[model]
+		ms.Requests++
+		if success {
+			ms.Success++
+		}
+		ms.InputTokens += inputTokens
+		ms.OutputTokens += outputTokens
+		ms.Images += images
+	}
+
+	// 小时统计
+	currentHour := now.Hour()
+	if currentHour != s.lastHour {
+		// 新的小时，重置该小时统计
+		s.hourlyStats[currentHour] = HourlyStats{Hour: currentHour}
+		s.lastHour = currentHour
+	}
+	hs := &s.hourlyStats[currentHour]
+	hs.Requests++
+	if success {
+		hs.Success++
+	}
+	hs.InputTokens += inputTokens
+	hs.OutputTokens += outputTokens
 }
 
 // GetRPM 计算最近一分钟的 RPM
@@ -184,6 +243,65 @@ func (s *APIStats) GetStats() map[string]interface{} {
 		"videos_generated": s.videoGenerated,
 		"current_rpm":      s.GetRPM(),
 		"average_rpm":      fmt.Sprintf("%.2f", avgRPM),
+	}
+}
+
+// GetDetailedStats 获取详细统计数据
+func (s *APIStats) GetDetailedStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	uptime := time.Since(s.startTime)
+	avgRPM := float64(0)
+	if uptime.Minutes() > 0 {
+		avgRPM = float64(s.totalRequests) / uptime.Minutes()
+	}
+
+	// 转换模型统计
+	modelStatsMap := make(map[string]interface{})
+	for model, ms := range s.modelStats {
+		modelStatsMap[model] = map[string]interface{}{
+			"requests":      ms.Requests,
+			"success":       ms.Success,
+			"success_rate":  fmt.Sprintf("%.2f%%", float64(ms.Success)/float64(max(ms.Requests, 1))*100),
+			"input_tokens":  ms.InputTokens,
+			"output_tokens": ms.OutputTokens,
+			"total_tokens":  ms.InputTokens + ms.OutputTokens,
+			"images":        ms.Images,
+		}
+	}
+
+	// 转换小时统计
+	hourlyStatsArr := make([]map[string]interface{}, 0, 24)
+	for i := 0; i < 24; i++ {
+		hs := s.hourlyStats[i]
+		if hs.Requests > 0 {
+			hourlyStatsArr = append(hourlyStatsArr, map[string]interface{}{
+				"hour":          i,
+				"requests":      hs.Requests,
+				"success":       hs.Success,
+				"input_tokens":  hs.InputTokens,
+				"output_tokens": hs.OutputTokens,
+			})
+		}
+	}
+
+	return map[string]interface{}{
+		"uptime":           uptime.String(),
+		"uptime_seconds":   int64(uptime.Seconds()),
+		"total_requests":   s.totalRequests,
+		"success_requests": s.successRequests,
+		"failed_requests":  s.failedRequests,
+		"success_rate":     fmt.Sprintf("%.2f%%", float64(s.successRequests)/float64(max(s.totalRequests, 1))*100),
+		"input_tokens":     s.inputTokens,
+		"output_tokens":    s.outputTokens,
+		"total_tokens":     s.inputTokens + s.outputTokens,
+		"images_generated": s.imageGenerated,
+		"videos_generated": s.videoGenerated,
+		"current_rpm":      s.GetRPM(),
+		"average_rpm":      fmt.Sprintf("%.2f", avgRPM),
+		"models":           modelStatsMap,
+		"hourly":           hourlyStatsArr,
 	}
 }
 
@@ -285,6 +403,7 @@ func loadAppConfig() {
 	if appConfig.Pool.BrowserRefreshMaxRetry >= 0 {
 		pool.BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
 	}
+	pool.AutoDelete401 = appConfig.Pool.AutoDelete401
 	pool.DataDir = DataDir
 	pool.DefaultConfig = DefaultConfig
 	pool.Proxy = Proxy
@@ -366,8 +485,28 @@ func initProxyPool() {
 	shouldHealthCheck := hasProxyConfig || appConfig.ProxyPool.HealthCheck
 
 	if shouldHealthCheck && appConfig.ProxyPool.CheckOnStartup {
-		logger.Info("🔍 开始代理健康检查...")
-		proxy.Manager.CheckAllHealth()
+		go func() {
+			proxy.Manager.CheckAllHealth()
+			// 健康检查完成后初始化实例池
+			if proxy.Manager.HealthyCount() > 0 {
+				poolSize := appConfig.Pool.RegisterThreads
+				if poolSize <= 0 {
+					poolSize = pool.DefaultProxyCount
+				}
+				if poolSize > 10 {
+					poolSize = 10
+				}
+				proxy.Manager.SetMaxPoolSize(poolSize)
+				if err := proxy.Manager.InitInstancePool(poolSize); err != nil {
+					logger.Warn("⚠️ 初始化代理实例池失败: %v", err)
+				} else {
+					logger.Info("✅ 代理实例池初始化完成: %d 个实例", poolSize)
+				}
+			}
+		}()
+	} else if proxy.Manager.TotalCount() > 0 {
+		// 不需要健康检查时直接标记就绪
+		proxy.Manager.SetReady(true)
 	}
 	if proxy.Manager.TotalCount() == 0 {
 		if appConfig.ProxyPool.Proxy != "" {
@@ -490,6 +629,48 @@ func getCommonHeaders(jwt, origAuth string) map[string]string {
 }
 
 func createSession(jwt, configID, origAuth string) (string, error) {
+	return createSessionWithRetry(jwt, configID, origAuth, 3)
+}
+
+// createSessionWithRetry 创建session带重试（处理400错误）
+func createSessionWithRetry(jwt, configID, origAuth string, maxRetries int) (string, error) {
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			// 等待后重试
+			waitTime := time.Duration(retry*500) * time.Millisecond
+			time.Sleep(waitTime)
+			log.Printf("🔄 createSession 重试 %d/%d", retry+1, maxRetries)
+		}
+
+		sessionName, err := createSessionOnce(jwt, configID, origAuth)
+		if err == nil {
+			return sessionName, nil
+		}
+
+		lastErr = err
+		errMsg := err.Error()
+
+		// 400错误可以重试
+		if strings.Contains(errMsg, "400") {
+			log.Printf("⚠️ createSession 400 错误，尝试重试...")
+			continue
+		}
+
+		// 401/403 不重试
+		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "403") {
+			return "", err
+		}
+
+		// 其他错误继续重试
+	}
+
+	return "", lastErr
+}
+
+// createSessionOnce 单次创建session
+func createSessionOnce(jwt, configID, origAuth string) (string, error) {
 	body := map[string]interface{}{
 		"configId":         configID,
 		"additionalParams": map[string]string{"token": "-"},
@@ -1635,8 +1816,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	var statsOutputTokens int64
 	var statsImages int64
 	var statsVideos int64
+	statsModel := req.Model
 	defer func() {
-		apiStats.RecordRequest(statsSuccess, statsInputTokens, statsOutputTokens, statsImages, statsVideos)
+		apiStats.RecordRequestWithModel(statsModel, statsSuccess, statsInputTokens, statsOutputTokens, statsImages, statsVideos)
 	}()
 
 	// 入站日志
@@ -2479,8 +2661,25 @@ func main() {
 }
 func runAsClient() {
 	log.Println("🔌 启动客户端模式...")
-	pool.RunBrowserRegister = func(headless bool, proxy string, id int) *pool.BrowserRegisterResult {
-		result := register.RunBrowserRegister(headless, proxy, id)
+
+	// 代理实例池由异步健康检查完成后初始化
+	// 设置代理就绪检查回调
+	pool.IsProxyReady = func() bool {
+		return proxy.Manager.IsReady()
+	}
+	pool.WaitProxyReady = func(timeout time.Duration) bool {
+		logger.Info("⏳ 等待代理就绪...")
+		result := proxy.Manager.WaitReady(timeout)
+		if result {
+			logger.Info("✅ 代理已就绪")
+		} else {
+			logger.Warn("⚠️ 代理等待超时")
+		}
+		return result
+	}
+
+	pool.RunBrowserRegister = func(headless bool, proxyURL string, id int) *pool.BrowserRegisterResult {
+		result := register.RunBrowserRegister(headless, proxyURL, id)
 		return &pool.BrowserRegisterResult{
 			Success:       result.Success,
 			Email:         result.Email,
@@ -2492,8 +2691,8 @@ func runAsClient() {
 			Error:         result.Error,
 		}
 	}
-	pool.RefreshCookieWithBrowser = func(acc *pool.Account, headless bool, proxy string) *pool.BrowserRefreshResult {
-		result := register.RefreshCookieWithBrowser(acc, headless, proxy)
+	pool.RefreshCookieWithBrowser = func(acc *pool.Account, headless bool, proxyURL string) *pool.BrowserRefreshResult {
+		result := register.RefreshCookieWithBrowser(acc, headless, proxyURL)
 		return &pool.BrowserRefreshResult{
 			Success:         result.Success,
 			SecureCookies:   result.SecureCookies,
@@ -2511,6 +2710,11 @@ func runAsClient() {
 			return proxy.Manager.Next()
 		}
 		return Proxy
+	}
+	// 释放代理的函数（通过URL查找并释放实例）
+	pool.ReleaseProxy = func(proxyURL string) {
+		proxy.Manager.ReleaseByURL(proxyURL)
+		logger.Debug("释放代理: %s", proxyURL)
 	}
 
 	client := pool.NewPoolClient(appConfig.PoolServer)
@@ -2787,6 +2991,14 @@ func setupAPIRoutes(r *gin.Engine) {
 		c.JSON(200, stats)
 	})
 
+	// 详细API统计
+	admin.GET("/stats", func(c *gin.Context) {
+		detailed := apiStats.GetDetailedStats()
+		detailed["pool"] = pool.Pool.Stats()
+		detailed["proxy_pool"] = proxy.Manager.PoolStats()
+		c.JSON(200, detailed)
+	})
+
 	admin.POST("/force-refresh", func(c *gin.Context) {
 		count := pool.Pool.ForceRefreshAll()
 		c.JSON(200, gin.H{
@@ -2916,6 +3128,8 @@ func runLocalMode() {
 	if err := pool.Pool.Load(DataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
+
+	// 代理实例池由异步健康检查完成后初始化
 
 	// 检查 CONFIG_ID
 	if DefaultConfig != "" {

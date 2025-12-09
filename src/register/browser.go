@@ -826,13 +826,20 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		l = l.Proxy(proxy)
 	}
 
-	url, err := l.Launch()
+	launcherURL, err := l.Launch()
 	if err != nil {
 		result.Error = fmt.Errorf("启动浏览器失败: %w", err)
 		return result
 	}
 
-	browser := rod.New().ControlURL(url)
+	// 确保浏览器进程被清理（即使连接失败）
+	defer func() {
+		if l != nil {
+			l.Kill()
+		}
+	}()
+
+	browser := rod.New().ControlURL(launcherURL)
 	if err := browser.Connect(); err != nil {
 		result.Error = fmt.Errorf("连接浏览器失败: %w", err)
 		return result
@@ -1833,13 +1840,20 @@ func RefreshCookieWithBrowser(acc *pool.Account, headless bool, proxy string) *B
 		l = l.Proxy(proxy)
 	}
 
-	url, err := l.Launch()
+	launcherURL, err := l.Launch()
 	if err != nil {
 		result.Error = fmt.Errorf("启动浏览器失败: %w", err)
 		return result
 	}
 
-	browser := rod.New().ControlURL(url)
+	// 确保浏览器进程被清理（即使连接失败）
+	defer func() {
+		if l != nil {
+			l.Kill()
+		}
+	}()
+
+	browser := rod.New().ControlURL(launcherURL)
 	if err := browser.Connect(); err != nil {
 		result.Error = fmt.Errorf("连接浏览器失败: %w", err)
 		return result

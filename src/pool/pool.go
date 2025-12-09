@@ -119,6 +119,7 @@ var (
 	EnableBrowserRefresh   = true             // 是否启用浏览器刷新
 	BrowserRefreshHeadless = true             // 浏览器刷新是否无头模式
 	BrowserRefreshMaxRetry = 1                // 浏览器刷新最大重试次数
+	AutoDelete401          = false            // 401时是否自动删除账号
 	DataDir                string
 	DefaultConfig          string
 	Proxy                  string
@@ -389,11 +390,21 @@ func (p *AccountPool) refreshWorker(id int) {
 		if err := acc.RefreshJWT(); err != nil {
 			errMsg := err.Error()
 
-			// 认证失败：尝试浏览器刷新（不删除账号）
+			// 认证失败：根据配置决定是否删除或尝试刷新
 			if strings.Contains(errMsg, "账号失效") ||
 				strings.Contains(errMsg, "401") ||
 				strings.Contains(errMsg, "403") {
 				log.Printf("⚠️ [worker-%d] [%s] 认证失效: %v", id, acc.Data.Email, err)
+
+				// 如果配置了401自动删除，直接删除账号
+				if AutoDelete401 {
+					log.Printf("🗑️ [worker-%d] [%s] 401自动删除已启用，移除账号", id, acc.Data.Email)
+					acc.Mu.Lock()
+					acc.Status = StatusInvalid
+					acc.Mu.Unlock()
+					p.RemoveAccount(acc)
+					continue
+				}
 
 				// 检查是否可以进行浏览器刷新
 				acc.Mu.Lock()

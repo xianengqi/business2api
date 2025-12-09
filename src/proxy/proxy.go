@@ -28,24 +28,34 @@ var tlsConfig = &tls.Config{InsecureSkipVerify: true}
 // ProxyNode 代理节点
 type ProxyNode struct {
 	Raw       string // 原始链接
-	Protocol  string // vmess, vless, ss, trojan, http, socks5
+	Protocol  string // vmess, vless, ss, trojan, http, socks5, hysteria2
 	Name      string
 	Server    string
 	Port      int
 	UUID      string // vmess/vless
 	AlterId   int    // vmess
 	Security  string // vmess 加密方式
-	Network   string // tcp, ws, grpc
+	Network   string // tcp, ws, grpc, kcp, quic
 	Path      string // ws path
 	Host      string // ws host
 	TLS       bool
 	SNI       string
 	Password  string // ss/trojan password
 	Method    string // ss method
+	Type      string // kcp/quic header type (none, srtp, utp, wechat-video, dtls, wireguard)
 	Healthy   bool
 	LastCheck time.Time
 	LocalPort int
 }
+
+// InstanceStatus 实例状态
+type InstanceStatus int
+
+const (
+	InstanceStatusIdle    InstanceStatus = iota // 空闲可用
+	InstanceStatusInUse                         // 使用中
+	InstanceStatusStopped                       // 已停止
+)
 
 // XrayInstance xray 实例
 type XrayInstance struct {
@@ -55,6 +65,10 @@ type XrayInstance struct {
 	running   bool
 	ctx       context.Context
 	cancel    context.CancelFunc
+	status    InstanceStatus
+	lastUsed  time.Time
+	proxyURL  string // 缓存的代理URL
+	mu        sync.Mutex
 }
 
 // ProxyManager 代理管理器
@@ -65,20 +79,130 @@ type ProxyManager struct {
 	currentIndex   int
 	basePort       int
 	instances      map[int]*XrayInstance
+	instancePool   []*XrayInstance // 预启动的实例池
+	maxPoolSize    int             // 最大实例池大小
 	subscribeURLs  []string
 	proxyFiles     []string
 	lastUpdate     time.Time
 	updateInterval time.Duration
 	checkInterval  time.Duration
 	healthCheckURL string
+	stopChan       chan struct{}
+	ready          bool       // 代理池是否就绪
+	readyCond      *sync.Cond // 就绪条件变量
+	healthChecking bool       // 是否正在健康检查
 }
 
 var Manager = &ProxyManager{
 	basePort:       10800,
 	instances:      make(map[int]*XrayInstance),
+	instancePool:   make([]*XrayInstance, 0),
+	maxPoolSize:    5, // 默认预启动5个实例
 	updateInterval: 30 * time.Minute,
 	checkInterval:  5 * time.Minute,
 	healthCheckURL: "https://www.google.com/generate_204",
+	stopChan:       make(chan struct{}),
+}
+
+func init() {
+	Manager.readyCond = sync.NewCond(&Manager.mu)
+}
+
+// IsReady 检查代理池是否就绪
+func (pm *ProxyManager) IsReady() bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.ready
+}
+
+// WaitReady 等待代理池就绪
+func (pm *ProxyManager) WaitReady(timeout time.Duration) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.ready {
+		return true
+	}
+
+	// 如果没有代理节点，直接返回
+	if len(pm.nodes) == 0 && !pm.healthChecking {
+		return false
+	}
+
+	// 使用超时等待
+	done := make(chan bool, 1)
+	go func() {
+		pm.mu.Lock()
+		for !pm.ready && pm.healthChecking {
+			pm.readyCond.Wait()
+		}
+		pm.mu.Unlock()
+		done <- pm.ready
+	}()
+
+	pm.mu.Unlock()
+	select {
+	case result := <-done:
+		pm.mu.Lock()
+		return result
+	case <-time.After(timeout):
+		pm.mu.Lock()
+		return pm.ready
+	}
+}
+
+// SetReady 设置就绪状态
+func (pm *ProxyManager) SetReady(ready bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.ready = ready
+	if ready {
+		pm.readyCond.Broadcast()
+	}
+}
+
+// SetMaxPoolSize 设置最大实例池大小
+func (pm *ProxyManager) SetMaxPoolSize(size int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if size > 0 {
+		pm.maxPoolSize = size
+	}
+}
+
+// InitInstancePool 初始化实例池（按需启动指定数量的代理实例）
+func (pm *ProxyManager) InitInstancePool(count int) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if len(pm.healthyNodes) == 0 && len(pm.nodes) == 0 {
+		return fmt.Errorf("没有可用的代理节点")
+	}
+
+	if count > pm.maxPoolSize {
+		count = pm.maxPoolSize
+	}
+
+	nodes := pm.healthyNodes
+	if len(nodes) == 0 {
+		nodes = pm.nodes
+	}
+
+	log.Printf("🔧 初始化代理实例池: 目标 %d 个实例", count)
+
+	for i := 0; i < count && i < len(nodes); i++ {
+		node := nodes[i%len(nodes)]
+		instance, err := pm.startInstanceLocked(node)
+		if err != nil {
+			log.Printf("⚠️ 启动实例 %d 失败: %v", i, err)
+			continue
+		}
+		instance.status = InstanceStatusIdle
+		pm.instancePool = append(pm.instancePool, instance)
+	}
+
+	log.Printf("✅ 实例池初始化完成: %d 个实例就绪", len(pm.instancePool))
+	return nil
 }
 
 func (pm *ProxyManager) SetXrayPath(path string) {
@@ -445,25 +569,36 @@ func parseDirectProxy(link string) *ProxyNode {
 	}
 }
 
-func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
+// startInstanceLocked 内部方法：启动实例（需要持有锁）
+func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, error) {
 	// 直接代理不需要 xray
 	if node.Protocol == "http" || node.Protocol == "https" || node.Protocol == "socks5" {
-		return node.Raw, nil
+		return &XrayInstance{
+			node:     node,
+			running:  true,
+			status:   InstanceStatusIdle,
+			proxyURL: node.Raw,
+			lastUsed: time.Now(),
+		}, nil
 	}
 
-	// 分配端口
-	localPort := pm.allocatePort()
+	// 分配端口（带重试）
+	var localPort int
+	for retry := 0; retry < 3; retry++ {
+		localPort = pm.allocatePort()
+		if localPort != 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if localPort == 0 {
-		return "", fmt.Errorf("无可用端口")
+		return nil, fmt.Errorf("无可用端口")
 	}
 
 	// 生成 xray 配置
 	xrayConfig := pm.buildXrayConfig(node, localPort)
 	if xrayConfig == nil {
-		return "", fmt.Errorf("生成配置失败")
+		return nil, fmt.Errorf("生成配置失败")
 	}
 
 	// 启动内置 xray
@@ -471,16 +606,24 @@ func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
 	server, err := core.New(xrayConfig)
 	if err != nil {
 		cancel()
-		return "", fmt.Errorf("创建 xray 实例失败: %w", err)
+		return nil, fmt.Errorf("创建 xray 实例失败: %w", err)
 	}
 
 	if err := server.Start(); err != nil {
 		cancel()
-		return "", fmt.Errorf("启动 xray 失败: %w", err)
+		return nil, fmt.Errorf("启动 xray 失败: %w", err)
 	}
 
-	// 等待端口可用
-	time.Sleep(300 * time.Millisecond)
+	// 等待端口可用并验证
+	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", localPort)
+	for i := 0; i < 10; i++ {
+		time.Sleep(50 * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			break
+		}
+	}
 
 	instance := &XrayInstance{
 		server:    server,
@@ -489,10 +632,24 @@ func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
 		running:   true,
 		ctx:       ctx,
 		cancel:    cancel,
+		status:    InstanceStatusIdle,
+		lastUsed:  time.Now(),
+		proxyURL:  proxyURL,
 	}
 	pm.instances[localPort] = instance
 	node.LocalPort = localPort
-	return fmt.Sprintf("socks5://127.0.0.1:%d", localPort), nil
+	return instance, nil
+}
+
+func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	instance, err := pm.startInstanceLocked(node)
+	if err != nil {
+		return "", err
+	}
+	return instance.proxyURL, nil
 }
 func (pm *ProxyManager) buildXrayConfig(node *ProxyNode, localPort int) *core.Config {
 	jsonConfig := pm.generateXrayConfig(node, localPort)
@@ -505,19 +662,39 @@ func (pm *ProxyManager) buildXrayConfig(node *ProxyNode, localPort int) *core.Co
 	return config
 }
 
-// allocatePort 分配端口
+// allocatePort 分配端口（增强版：多次尝试+端口验证）
 func (pm *ProxyManager) allocatePort() int {
 	for port := pm.basePort; port < pm.basePort+1000; port++ {
-		if _, exists := pm.instances[port]; !exists {
-			// 检查端口是否可用
-			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-			if err == nil {
-				ln.Close()
-				return port
-			}
+		if _, exists := pm.instances[port]; exists {
+			continue
+		}
+		// 检查端口是否真正可用（双重验证）
+		if pm.isPortAvailable(port) {
+			return port
 		}
 	}
 	return 0
+}
+
+// isPortAvailable 检查端口是否可用
+func (pm *ProxyManager) isPortAvailable(port int) bool {
+	// 尝试绑定 TCP
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+
+	// 短暂等待端口释放
+	time.Sleep(10 * time.Millisecond)
+
+	// 再次验证
+	ln2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	ln2.Close()
+	return true
 }
 
 // generateXrayConfig 生成 xray 配置
@@ -589,6 +766,18 @@ func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) strin
 			"streamSettings": %s,
 			%s
 		}`, node.Server, node.Port, node.Password, pm.generateStreamSettings(node), muxConfig)
+
+	case "hysteria2", "hy2":
+		// Hysteria2 使用 QUIC 传输
+		outbound = fmt.Sprintf(`{
+			"protocol": "hysteria2",
+			"settings": {
+				"servers": [{
+					"address": "%s:%d",
+					"password": "%s"
+				}]
+			}
+		}`, node.Server, node.Port, node.Password)
 	}
 
 	return fmt.Sprintf(`{
@@ -620,6 +809,32 @@ func (pm *ProxyManager) generateStreamSettings(node *ProxyNode) string {
 		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "headers": {"Host": "%s"}}`, node.Path, node.Host)
 	case "grpc":
 		settings = fmt.Sprintf(`"grpcSettings": {"serviceName": "%s"}`, node.Path)
+	case "kcp", "mkcp":
+		// mKCP 传输配置
+		headerType := "none"
+		if node.Type != "" {
+			headerType = node.Type
+		}
+		settings = fmt.Sprintf(`"kcpSettings": {
+			"mtu": 1350,
+			"tti": 50,
+			"uplinkCapacity": 12,
+			"downlinkCapacity": 100,
+			"congestion": false,
+			"readBufferSize": 2,
+			"writeBufferSize": 2,
+			"header": {"type": "%s"}
+		}`, headerType)
+	case "quic":
+		headerType := "none"
+		if node.Type != "" {
+			headerType = node.Type
+		}
+		settings = fmt.Sprintf(`"quicSettings": {
+			"security": "none",
+			"key": "",
+			"header": {"type": "%s"}
+		}`, headerType)
 	default:
 		settings = ""
 	}
@@ -710,12 +925,14 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 }
 
 func (pm *ProxyManager) CheckAllHealth() {
-	pm.mu.RLock()
+	pm.mu.Lock()
+	pm.healthChecking = true
 	nodes := make([]*ProxyNode, len(pm.nodes))
 	copy(nodes, pm.nodes)
-	pm.mu.RUnlock()
+	pm.mu.Unlock()
 
 	if len(nodes) == 0 {
+		pm.SetReady(true)
 		return
 	}
 
@@ -758,13 +975,66 @@ func (pm *ProxyManager) CheckAllHealth() {
 
 	pm.mu.Lock()
 	pm.healthyNodes = healthy
+	pm.healthChecking = false
+	pm.ready = len(healthy) > 0
+	pm.readyCond.Broadcast()
 	pm.mu.Unlock()
 
 	log.Printf("✅ 健康检查完成: %d/%d 节点可用", len(healthy), len(nodes))
 }
 
-// Next 获取下一个健康代理
+// GetFromPool 从实例池获取一个空闲实例
+func (pm *ProxyManager) GetFromPool() *XrayInstance {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// 查找空闲实例
+	for _, inst := range pm.instancePool {
+		inst.mu.Lock()
+		if inst.status == InstanceStatusIdle && inst.running {
+			inst.status = InstanceStatusInUse
+			inst.lastUsed = time.Now()
+			inst.mu.Unlock()
+			return inst
+		}
+		inst.mu.Unlock()
+	}
+	return nil
+}
+
+// ReturnToPool 归还实例到池
+func (pm *ProxyManager) ReturnToPool(inst *XrayInstance) {
+	if inst == nil {
+		return
+	}
+	inst.mu.Lock()
+	inst.status = InstanceStatusIdle
+	inst.mu.Unlock()
+}
+
+// ReleaseByURL 通过proxyURL释放实例
+func (pm *ProxyManager) ReleaseByURL(proxyURL string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for _, inst := range pm.instancePool {
+		inst.mu.Lock()
+		if inst.proxyURL == proxyURL && inst.status == InstanceStatusInUse {
+			inst.status = InstanceStatusIdle
+			inst.mu.Unlock()
+			return
+		}
+		inst.mu.Unlock()
+	}
+}
+
+// Next 获取下一个健康代理（优先从池中获取）
 func (pm *ProxyManager) Next() string {
+	// 首先尝试从池中获取
+	if inst := pm.GetFromPool(); inst != nil {
+		return inst.proxyURL
+	}
+
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -776,29 +1046,56 @@ func (pm *ProxyManager) Next() string {
 		node := pm.nodes[pm.currentIndex%len(pm.nodes)]
 		pm.currentIndex++
 
-		// 尝试启动
-		pm.mu.Unlock()
-		proxy, err := pm.StartXray(node)
-		pm.mu.Lock()
+		// 尝试启动新实例
+		instance, err := pm.startInstanceLocked(node)
 		if err != nil {
 			log.Printf("⚠️ 启动代理失败: %v", err)
 			return ""
 		}
-		return proxy
+		instance.status = InstanceStatusInUse
+		pm.instancePool = append(pm.instancePool, instance)
+		return instance.proxyURL
 	}
 
 	node := pm.healthyNodes[pm.currentIndex%len(pm.healthyNodes)]
 	pm.currentIndex++
 
-	// 启动 xray
-	pm.mu.Unlock()
-	proxy, err := pm.StartXray(node)
-	pm.mu.Lock()
+	// 启动新实例
+	instance, err := pm.startInstanceLocked(node)
 	if err != nil {
 		log.Printf("⚠️ 启动代理失败: %v", err)
 		return ""
 	}
-	return proxy
+	instance.status = InstanceStatusInUse
+
+	// 控制池大小
+	if len(pm.instancePool) < pm.maxPoolSize {
+		pm.instancePool = append(pm.instancePool, instance)
+	}
+	return instance.proxyURL
+}
+
+// PoolStats 返回实例池统计
+func (pm *ProxyManager) PoolStats() map[string]int {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	idle, inUse := 0, 0
+	for _, inst := range pm.instancePool {
+		inst.mu.Lock()
+		switch inst.status {
+		case InstanceStatusIdle:
+			idle++
+		case InstanceStatusInUse:
+			inUse++
+		}
+		inst.mu.Unlock()
+	}
+	return map[string]int{
+		"idle":   idle,
+		"in_use": inUse,
+		"total":  len(pm.instancePool),
+	}
 }
 
 // Count 获取代理数量
@@ -843,7 +1140,6 @@ func (pm *ProxyManager) StartAutoUpdate() {
 	go func() {
 		// 延迟几秒后开始首次检查
 		time.Sleep(3 * time.Second)
-		log.Printf("🔍 开始后台健康检查...")
 		pm.CheckAllHealth()
 
 		// 定期检查

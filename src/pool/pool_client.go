@@ -33,7 +33,12 @@ var (
 	RunBrowserRegister RunBrowserRegisterFunc
 	ClientHeadless     bool
 	ClientProxy        string
-	GetClientProxy     func() string // 获取代理的函数
+	GetClientProxy     func() string                    // 获取代理的函数
+	ReleaseProxy       func(proxyURL string)            // 释放代理的函数
+	DefaultProxyCount  = 3                              // 客户端模式默认启动的代理实例数
+	IsProxyReady       func() bool                      // 检查代理是否就绪
+	WaitProxyReady     func(timeout time.Duration) bool // 等待代理就绪
+	proxyReadyTimeout  = 60 * time.Second               // 代理就绪超时时间
 )
 
 // PoolClient 号池客户端
@@ -259,6 +264,13 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 
 	logger.Info("收到注册任务: %d 个账号", count)
 
+	// 等待代理就绪
+	if WaitProxyReady != nil {
+		if !WaitProxyReady(proxyReadyTimeout) {
+			logger.Warn("代理未就绪，使用静态代理: %s", ClientProxy)
+		}
+	}
+
 	for i := 0; i < count; i++ {
 		// 获取代理（优先使用代理池）
 		currentProxy := ClientProxy
@@ -267,6 +279,11 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 		}
 		logger.Info("[注册 %d] 使用代理: %s", i, currentProxy)
 		result := RunBrowserRegister(ClientHeadless, currentProxy, i)
+
+		// 任务完成后释放代理
+		if ReleaseProxy != nil && currentProxy != "" && currentProxy != ClientProxy {
+			ReleaseProxy(currentProxy)
+		}
 
 		if result.Success {
 			// 上传账号到服务器
@@ -298,6 +315,13 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 
 	logger.Info("收到续期任务: %s", email)
 
+	// 等待代理就绪
+	if WaitProxyReady != nil {
+		if !WaitProxyReady(proxyReadyTimeout) {
+			logger.Warn("代理未就绪，使用静态代理: %s", Proxy)
+		}
+	}
+
 	// 构建临时账号对象
 	acc := &Account{
 		Data: AccountData{
@@ -328,8 +352,19 @@ func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
 		acc.CSESIDX = csesidx
 	}
 
+	// 获取代理（优先使用代理池）
+	currentProxy := Proxy
+	if GetClientProxy != nil {
+		currentProxy = GetClientProxy()
+	}
+
 	// 执行浏览器刷新
-	result := RefreshCookieWithBrowser(acc, BrowserRefreshHeadless, Proxy)
+	result := RefreshCookieWithBrowser(acc, BrowserRefreshHeadless, currentProxy)
+
+	// 任务完成后释放代理
+	if ReleaseProxy != nil && currentProxy != "" && currentProxy != Proxy {
+		ReleaseProxy(currentProxy)
+	}
 
 	if result.Success {
 		logger.Info("✅ 账号续期成功: %s", email)

@@ -951,6 +951,42 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	// 重新加载账号池
 	ps.pool.Load(dataDir)
 
+	// 如果是续期数据，标记账号为已刷新，防止继续刷新
+	if !req.IsNew {
+		ps.pool.mu.Lock()
+		for _, acc := range ps.pool.pendingAccounts {
+			if acc.Data.Email == req.Email {
+				acc.Refreshed = true
+				acc.FailCount = 0
+				acc.BrowserRefreshCount = 0
+				acc.LastRefresh = time.Now()
+				acc.JWTExpires = time.Time{} // 重置JWT过期时间，让它重新获取
+				// 移到就绪队列
+				ps.pool.mu.Unlock()
+				ps.pool.MarkReady(acc)
+				logger.Info("✅ [%s] 续期数据已应用，移至就绪队列", req.Email)
+				goto respond
+			}
+		}
+		// 也检查就绪队列中的账号（可能已经在就绪队列中）
+		for _, acc := range ps.pool.readyAccounts {
+			if acc.Data.Email == req.Email {
+				acc.Mu.Lock()
+				acc.Refreshed = true
+				acc.FailCount = 0
+				acc.BrowserRefreshCount = 0
+				acc.LastRefresh = time.Now()
+				acc.JWTExpires = time.Time{}
+				acc.Mu.Unlock()
+				logger.Info("✅ [%s] 续期数据已更新到就绪账号", req.Email)
+				break
+			}
+		}
+		ps.pool.mu.Unlock()
+	}
+
+respond:
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"message": fmt.Sprintf("账号 %s 已保存", req.Email),
