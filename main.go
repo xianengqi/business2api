@@ -149,7 +149,6 @@ func (s *APIStats) RecordRequest(success bool, inputTokens, outputTokens, images
 	s.RecordRequestWithModel("", success, inputTokens, outputTokens, images, videos)
 }
 
-// RecordRequestWithModel 记录请求（带模型）
 func (s *APIStats) RecordRequestWithModel(model string, success bool, inputTokens, outputTokens, images, videos int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -95,10 +95,12 @@ type Account struct {
 	LastRefresh         time.Time
 	LastUsed            time.Time // 最后使用时间
 	Refreshed           bool
-	FailCount           int // 连续失败次数
-	BrowserRefreshCount int // 浏览器刷新尝试次数
-	SuccessCount        int // 成功次数
-	TotalCount          int // 总使用次数
+	FailCount           int    // 连续失败次数
+	BrowserRefreshCount int    // 浏览器刷新尝试次数
+	SuccessCount        int    // 成功次数
+	TotalCount          int    // 总使用次数
+	DailyCount          int    // 每日调用次数
+	DailyCountDate      string // 每日计数日期 (YYYY-MM-DD)
 	Status              AccountStatus
 	Mu                  sync.Mutex
 }
@@ -120,6 +122,7 @@ var (
 	BrowserRefreshHeadless = true             // 浏览器刷新是否无头模式
 	BrowserRefreshMaxRetry = 1                // 浏览器刷新最大重试次数
 	AutoDelete401          = false            // 401时是否自动删除账号
+	DailyLimit             = 3000             // 每账号每日最大调用次数
 	DataDir                string
 	DefaultConfig          string
 	Proxy                  string
@@ -203,6 +206,18 @@ func SetCooldowns(refreshSec, useSec int) {
 		UseCooldown = time.Duration(useSec) * time.Second
 	}
 	logger.Info("⚙️ 冷却配置: 刷新=%v, 使用=%v", RefreshCooldown, UseCooldown)
+}
+
+// SetDailyLimit 设置每账号每日最大调用次数
+func SetDailyLimit(limit int) {
+	if limit >= 0 {
+		DailyLimit = limit
+		if limit == 0 {
+			logger.Info("⚙️ 每日调用限制: 无限制")
+		} else {
+			logger.Info("⚙️ 每日调用限制: %d次/账号", limit)
+		}
+	}
 }
 
 func (p *AccountPool) Load(dir string) error {
@@ -594,6 +609,33 @@ func (p *AccountPool) RefreshAllAccounts() {
 	}
 }
 
+// checkAndUpdateDailyCount 检查并更新每日计数，返回是否超限
+func (acc *Account) checkAndUpdateDailyCount() bool {
+	today := time.Now().Format("2006-01-02")
+	if acc.DailyCountDate != today {
+		// 新的一天，重置计数
+		acc.DailyCountDate = today
+		acc.DailyCount = 0
+	}
+	// 检查是否超过每日限制
+	if DailyLimit > 0 && acc.DailyCount >= DailyLimit {
+		return true // 超限
+	}
+	acc.DailyCount++
+	return false
+}
+
+// GetDailyUsage 获取每日使用情况
+func (acc *Account) GetDailyUsage() (count int, limit int, date string) {
+	acc.Mu.Lock()
+	defer acc.Mu.Unlock()
+	today := time.Now().Format("2006-01-02")
+	if acc.DailyCountDate != today {
+		return 0, DailyLimit, today
+	}
+	return acc.DailyCount, DailyLimit, acc.DailyCountDate
+}
+
 func (p *AccountPool) Next() *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -608,20 +650,35 @@ func (p *AccountPool) Next() *Account {
 
 	var bestAccount *Account
 	var oldestUsed time.Time
+	var allExceededDaily bool = true
 
-	// 第一轮：找不在使用冷却中的账号
+	// 第一轮：找不在使用冷却中且未超日限的账号
 	for i := 0; i < n; i++ {
 		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
 		acc.Mu.Lock()
 		inUseCooldown := now.Sub(acc.LastUsed) < UseCooldown
 		lastUsed := acc.LastUsed
+
+		// 检查每日限制（不更新计数）
+		today := now.Format("2006-01-02")
+		dailyCount := acc.DailyCount
+		if acc.DailyCountDate != today {
+			dailyCount = 0
+		}
+		exceededDaily := DailyLimit > 0 && dailyCount >= DailyLimit
 		acc.Mu.Unlock()
 
+		if exceededDaily {
+			continue // 跳过已达每日限制的账号
+		}
+		allExceededDaily = false
+
 		if !inUseCooldown {
-			// 找到可用账号，标记使用时间
+			// 找到可用账号，标记使用时间并更新每日计数
 			acc.Mu.Lock()
 			acc.LastUsed = now
 			acc.TotalCount++
+			acc.checkAndUpdateDailyCount()
 			acc.Mu.Unlock()
 			atomic.AddInt64(&p.totalRequests, 1)
 			return acc
@@ -634,11 +691,18 @@ func (p *AccountPool) Next() *Account {
 		}
 	}
 
-	// 所有账号都在冷却中，返回最久未使用的
+	// 所有账号都超过每日限制
+	if allExceededDaily {
+		log.Printf("⚠️ 所有账号已达每日调用上限 (%d次/天)", DailyLimit)
+		return nil
+	}
+
+	// 所有未超限的账号都在冷却中，返回最久未使用的
 	if bestAccount != nil {
 		bestAccount.Mu.Lock()
 		bestAccount.LastUsed = now
 		bestAccount.TotalCount++
+		bestAccount.checkAndUpdateDailyCount()
 		bestAccount.Mu.Unlock()
 		atomic.AddInt64(&p.totalRequests, 1)
 		log.Printf("⏳ 所有账号在使用冷却中，选择最久未用: %s", bestAccount.Data.Email)
@@ -706,14 +770,35 @@ func (p *AccountPool) Stats() map[string]interface{} {
 		successRate = float64(totalSuccess) / float64(totalRequests) * 100
 	}
 
+	// 统计每日可用账号数
+	today := time.Now().Format("2006-01-02")
+	availableToday := 0
+	exceededToday := 0
+	for _, acc := range p.readyAccounts {
+		acc.Mu.Lock()
+		dailyCount := acc.DailyCount
+		if acc.DailyCountDate != today {
+			dailyCount = 0
+		}
+		acc.Mu.Unlock()
+		if DailyLimit == 0 || dailyCount < DailyLimit {
+			availableToday++
+		} else {
+			exceededToday++
+		}
+	}
+
 	return map[string]interface{}{
-		"ready":          len(p.readyAccounts),
-		"pending":        len(p.pendingAccounts),
-		"total":          len(p.readyAccounts) + len(p.pendingAccounts),
-		"total_requests": totalRequests,
-		"total_success":  totalSuccess,
-		"total_failed":   totalFailed,
-		"success_rate":   fmt.Sprintf("%.1f%%", successRate),
+		"ready":           len(p.readyAccounts),
+		"pending":         len(p.pendingAccounts),
+		"total":           len(p.readyAccounts) + len(p.pendingAccounts),
+		"available_today": availableToday,
+		"exceeded_today":  exceededToday,
+		"total_requests":  totalRequests,
+		"total_success":   totalSuccess,
+		"total_failed":    totalFailed,
+		"success_rate":    fmt.Sprintf("%.1f%%", successRate),
+		"daily_limit":     DailyLimit,
 		"cooldowns": map[string]interface{}{
 			"refresh_sec": int(RefreshCooldown.Seconds()),
 			"use_sec":     int(UseCooldown.Seconds()),
@@ -723,14 +808,17 @@ func (p *AccountPool) Stats() map[string]interface{} {
 
 // AccountInfo 账号信息（用于API返回）
 type AccountInfo struct {
-	Email        string    `json:"email"`
-	Status       string    `json:"status"`
-	LastRefresh  time.Time `json:"last_refresh"`
-	LastUsed     time.Time `json:"last_used"`
-	FailCount    int       `json:"fail_count"`
-	SuccessCount int       `json:"success_count"`
-	TotalCount   int       `json:"total_count"`
-	JWTExpires   time.Time `json:"jwt_expires"`
+	Email          string    `json:"email"`
+	Status         string    `json:"status"`
+	LastRefresh    time.Time `json:"last_refresh"`
+	LastUsed       time.Time `json:"last_used"`
+	FailCount      int       `json:"fail_count"`
+	SuccessCount   int       `json:"success_count"`
+	TotalCount     int       `json:"total_count"`
+	DailyCount     int       `json:"daily_count"`
+	DailyLimit     int       `json:"daily_limit"`
+	DailyRemaining int       `json:"daily_remaining"`
+	JWTExpires     time.Time `json:"jwt_expires"`
 }
 
 // ListAccounts 列出所有账号信息
@@ -746,18 +834,32 @@ func (p *AccountPool) ListAccounts() []AccountInfo {
 		StatusInvalid:  "invalid",
 	}
 
+	today := time.Now().Format("2006-01-02")
 	addAccounts := func(list []*Account) {
 		for _, acc := range list {
 			acc.Mu.Lock()
+			dailyCount := acc.DailyCount
+			if acc.DailyCountDate != today {
+				dailyCount = 0
+			}
+			dailyRemaining := DailyLimit - dailyCount
+			if DailyLimit == 0 {
+				dailyRemaining = -1 // -1 表示无限制
+			} else if dailyRemaining < 0 {
+				dailyRemaining = 0
+			}
 			info := AccountInfo{
-				Email:        acc.Data.Email,
-				Status:       statusNames[acc.Status],
-				LastRefresh:  acc.LastRefresh,
-				LastUsed:     acc.LastUsed,
-				FailCount:    acc.FailCount,
-				SuccessCount: acc.SuccessCount,
-				TotalCount:   acc.TotalCount,
-				JWTExpires:   acc.JWTExpires,
+				Email:          acc.Data.Email,
+				Status:         statusNames[acc.Status],
+				LastRefresh:    acc.LastRefresh,
+				LastUsed:       acc.LastUsed,
+				FailCount:      acc.FailCount,
+				SuccessCount:   acc.SuccessCount,
+				TotalCount:     acc.TotalCount,
+				DailyCount:     dailyCount,
+				DailyLimit:     DailyLimit,
+				DailyRemaining: dailyRemaining,
+				JWTExpires:     acc.JWTExpires,
 			}
 			acc.Mu.Unlock()
 			accounts = append(accounts, info)

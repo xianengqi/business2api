@@ -391,19 +391,112 @@ var emailInputSelectors = []string{
 	"input:not([type='hidden']):not([type='submit']):not([type='checkbox'])",
 }
 
-// 系统浏览器路径列表
+// 浏览器环境变量列表（按优先级）
+var browserEnvVars = []string{
+	"CHROME_PATH",
+	"CHROMIUM_PATH",
+	"EDGE_PATH",
+	"BROWSER_PATH",
+	"GOOGLE_CHROME_BIN",
+	"CHROMIUM_BIN",
+}
+
+// 系统浏览器路径列表（按优先级排序）
 var systemBrowserPaths = []string{
 	"/usr/bin/google-chrome",
 	"/usr/bin/google-chrome-stable",
+	"/usr/bin/google-chrome-beta",
+	"/usr/bin/google-chrome-unstable",
+	"/opt/google/chrome/chrome",
+	"/opt/google/chrome/google-chrome",
 	"/usr/bin/chromium",
 	"/usr/bin/chromium-browser",
+	"/usr/lib/chromium/chromium",
+	"/usr/lib/chromium-browser/chromium-browser",
 	"/snap/bin/chromium",
-	"/opt/google/chrome/chrome",
+	"/snap/chromium/current/usr/lib/chromium-browser/chrome",
+	"/usr/bin/microsoft-edge",
+	"/usr/bin/microsoft-edge-stable",
+	"/usr/bin/microsoft-edge-beta",
+	"/usr/bin/microsoft-edge-dev",
+	"/opt/microsoft/msedge/msedge",
+	"/usr/bin/chromium-browser",
 	"/usr/lib/chromium/chromium",
 	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
 	"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+	"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+	"%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe",
+	"%LOCALAPPDATA%\\Microsoft\\Edge\\Application\\msedge.exe",
 	"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+	"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
 	"/Applications/Chromium.app/Contents/MacOS/Chromium",
+	"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+	"/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
+	"/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+}
+
+// findBrowser 查找可用浏览器（优先环境变量，然后系统路径）
+func findBrowser() (string, bool) {
+	// 1. 优先检查环境变量
+	for _, envVar := range browserEnvVars {
+		if path := os.Getenv(envVar); path != "" {
+			// 扩展 Windows 环境变量
+			path = os.ExpandEnv(path)
+			if _, err := os.Stat(path); err == nil {
+				log.Printf("🌐 从环境变量 %s 获取浏览器: %s", envVar, path)
+				return path, true
+			}
+		}
+	}
+
+	// 2. 检查系统路径
+	for _, path := range systemBrowserPaths {
+		// 扩展 Windows 环境变量（如 %LOCALAPPDATA%）
+		expandedPath := os.ExpandEnv(path)
+		if _, err := os.Stat(expandedPath); err == nil {
+			return expandedPath, true
+		}
+	}
+
+	// 3. 尝试通过 PATH 查找
+	pathBrowsers := []string{"google-chrome", "chromium", "chromium-browser", "microsoft-edge", "chrome", "msedge"}
+	for _, name := range pathBrowsers {
+		if path, err := findInPath(name); err == nil && path != "" {
+			log.Printf("🌐 从 PATH 找到浏览器: %s", path)
+			return path, true
+		}
+	}
+
+	return "", false
+}
+
+// findInPath 在 PATH 中查找可执行文件
+func findInPath(name string) (string, error) {
+	pathEnv := os.Getenv("PATH")
+	var separator string
+	if strings.Contains(pathEnv, ";") {
+		separator = ";" // Windows
+	} else {
+		separator = ":" // Unix
+	}
+
+	for _, dir := range strings.Split(pathEnv, separator) {
+		if dir == "" {
+			continue
+		}
+		// 在 Windows 上添加 .exe 后缀
+		paths := []string{
+			filepath.Join(dir, name),
+			filepath.Join(dir, name+".exe"),
+		}
+		for _, path := range paths {
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				return path, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("not found: %s", name)
 }
 
 // BrowserSession 浏览器会话（封装公共逻辑）
@@ -417,20 +510,17 @@ type BrowserSession struct {
 	mu            sync.Mutex
 }
 
-// createBrowserSession 创建浏览器会话（统一的浏览器启动逻辑）
 func createBrowserSession(headless bool, proxy string, logPrefix string) (*BrowserSession, error) {
 	session := &BrowserSession{}
 
-	// 启动浏览器
+	// 启动浏览器 - 使用统一的浏览器查找逻辑
 	l := launcher.New()
-	for _, path := range systemBrowserPaths {
-		if _, err := os.Stat(path); err == nil {
-			l = l.Bin(path)
-			log.Printf("%s 使用浏览器: %s", logPrefix, path)
-			break
-		}
+	if browserPath, found := findBrowser(); found {
+		l = l.Bin(browserPath)
+		log.Printf("%s 使用浏览器: %s", logPrefix, browserPath)
+	} else {
+		log.Printf("%s ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", logPrefix)
 	}
-
 	l = l.Headless(headless).
 		Set("incognito").
 		Set("no-sandbox").
@@ -472,8 +562,6 @@ func createBrowserSession(headless bool, proxy string, logPrefix string) (*Brows
 		return nil, fmt.Errorf("连接浏览器失败: %w", err)
 	}
 	session.Browser = browser.Timeout(120 * time.Second)
-
-	// 使用 stealth 创建页面
 	page, err := stealth.Page(session.Browser)
 	if err != nil {
 		session.Close()
@@ -483,8 +571,6 @@ func createBrowserSession(headless bool, proxy string, logPrefix string) (*Brows
 
 	// 设置视口
 	page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{Width: 1280, Height: 800})
-
-	// 注入反检测脚本
 	page.Eval(`() => {
 		Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 		if (window.chrome) { window.chrome.runtime = undefined; }
@@ -503,7 +589,6 @@ func createBrowserSession(headless bool, proxy string, logPrefix string) (*Brows
 		});
 		Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
 	}`)
-
 	return session, nil
 }
 
@@ -904,40 +989,12 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}
 	result.Email = email
 
-	// 启动浏览器 - 优先使用系统浏览器
+	// 启动浏览器 - 使用统一的浏览器查找逻辑
 	l := launcher.New()
-
-	// 检测系统浏览器（支持更多环境）
-	systemBrowsers := []string{
-		// Linux
-		"/usr/bin/google-chrome",
-		"/usr/bin/google-chrome-stable",
-		"/usr/bin/chromium",
-		"/usr/bin/chromium-browser",
-		"/snap/bin/chromium",
-		"/opt/google/chrome/chrome",
-		// Docker/Alpine
-		"/usr/bin/chromium-browser",
-		"/usr/lib/chromium/chromium",
-		// Windows
-		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-		"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-		// macOS
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		"/Applications/Chromium.app/Contents/MacOS/Chromium",
-	}
-
-	browserFound := false
-	for _, path := range systemBrowsers {
-		if _, err := os.Stat(path); err == nil {
-			l = l.Bin(path)
-			browserFound = true
-			log.Printf("[注册 %d] 使用浏览器: %s", threadID, path)
-			break
-		}
-	}
-
-	if !browserFound {
+	if browserPath, found := findBrowser(); found {
+		l = l.Bin(browserPath)
+		log.Printf("[注册 %d] 使用浏览器: %s", threadID, browserPath)
+	} else {
 		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
 	}
 
@@ -1090,13 +1147,13 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		page.WaitLoad()
 	}
 
-	if _, err := page.Timeout(15 * time.Second).Element("input"); err != nil { 
+	if _, err := page.Timeout(15 * time.Second).Element("input"); err != nil {
 		result.Error = fmt.Errorf("等待输入框超时: %w", err)
 		return result
 	}
-	time.Sleep(200 * time.Millisecond) 
+	time.Sleep(200 * time.Millisecond)
 	log.Printf("[注册 %d] 准备输入邮箱: %s", threadID, email)
-	time.Sleep(500 * time.Millisecond) 
+	time.Sleep(500 * time.Millisecond)
 	var emailInput *rod.Element
 	selectors := []string{
 		"#email-input",            // Google Business 特定 ID
