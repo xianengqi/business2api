@@ -83,6 +83,7 @@ type AppConfig struct {
 	PoolServer     pool.PoolServerConfig `json:"pool_server"`     // 号池服务器配置
 	Debug          bool                  `json:"debug"`           // 调试模式
 	Flow           FlowConfigSection     `json:"flow"`            // Flow 配置
+	Note           []string              `json:"note"`            // 备注信息（支持多行）
 }
 
 // PoolMode 号池模式
@@ -405,6 +406,11 @@ func loadAppConfig() {
 		pool.BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
 	}
 	pool.AutoDelete401 = appConfig.Pool.AutoDelete401
+	// 服务端模式下，如果 expired_action 是 delete，则同步设置 AutoDelete401
+	if appConfig.PoolServer.Enable && appConfig.PoolServer.Mode == "server" && appConfig.PoolServer.ExpiredAction == "delete" {
+		pool.AutoDelete401 = true
+		logger.Info("🗑️ 服务端模式 expired_action=delete，启用 AutoDelete401")
+	}
 	pool.DataDir = DataDir
 	pool.DefaultConfig = DefaultConfig
 	pool.Proxy = Proxy
@@ -563,6 +569,9 @@ func initProxyPool() {
 			return proxy.Manager.Next()
 		}
 		return Proxy
+	}
+	register.ReleaseProxy = func(proxyURL string) {
+		proxy.Manager.ReleaseByURL(proxyURL)
 	}
 }
 
@@ -2940,6 +2949,10 @@ func setupAPIRoutes(r *gin.Engine) {
 			},
 			// Flow 状态
 			"flow_enabled": flowHandler != nil,
+		}
+		// 添加备注信息
+		if len(appConfig.Note) > 0 {
+			response["note"] = appConfig.Note
 		}
 		// 服务端模式：添加客户端信息
 		if poolServer != nil {

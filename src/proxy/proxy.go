@@ -1000,7 +1000,6 @@ func (pm *ProxyManager) StopAll() {
 func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 	proxyURL, err := pm.StartXray(node)
 	if err != nil {
-		log.Printf("⚠️ [%s] 启动失败: %v", node.Name, err)
 		return false
 	}
 	defer func() {

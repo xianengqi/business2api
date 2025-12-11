@@ -126,13 +126,13 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 	if testErr != nil {
 		singBox.Close()
 		cancel()
-		return "", fmt.Errorf("代理连通性测试失败: %w", testErr)
+		return "", fmt.Errorf("连通性测试失败: %w", testErr)
 	}
 	testResp.Body.Close()
 	if testResp.StatusCode != 204 && testResp.StatusCode != 200 {
 		singBox.Close()
 		cancel()
-		return "", fmt.Errorf("代理连通性测试失败: 状态码 %d", testResp.StatusCode)
+		return "", fmt.Errorf("连通性测试状态码: %d", testResp.StatusCode)
 	}
 
 	instance := &SingboxInstance{

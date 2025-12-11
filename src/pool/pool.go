@@ -471,13 +471,25 @@ func (p *AccountPool) refreshWorker(id int) {
 				acc.Mu.Lock()
 				acc.FailCount++
 				failCount := acc.FailCount
+				browserRefreshCount = acc.BrowserRefreshCount
 				acc.Mu.Unlock()
+				maxRetry := MaxFailCount * 3 // 401的最大重试次数更宽松
+				if maxRetry < 10 {
+					maxRetry = 10 // 至少重试10次
+				}
+				if browserRefreshCount >= BrowserRefreshMaxRetry && failCount >= maxRetry {
+					acc.Mu.Lock()
+					acc.Status = StatusInvalid
+					acc.Mu.Unlock()
+					p.RemoveAccount(acc)
+					continue
+				}
 
 				waitTime := time.Duration(failCount*30) * time.Second
 				if waitTime > 5*time.Minute {
 					waitTime = 5 * time.Minute // 最大等待5分钟
 				}
-				log.Printf("⏳ [worker-%d] [%s] 401刷新失败 (%d次)，%v后重试", id, acc.Data.Email, failCount, waitTime)
+				log.Printf("⏳ [worker-%d] [%s] 401刷新失败 (%d/%d次)，%v后重试", id, acc.Data.Email, failCount, maxRetry, waitTime)
 				time.Sleep(waitTime)
 
 				p.mu.Lock()

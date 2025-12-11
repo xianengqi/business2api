@@ -408,35 +408,70 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 		maxThreads = 1
 	}
 	assignedCount := 0
-	ps.pool.mu.RLock()
-	var refreshAccounts []*Account
-	for _, acc := range ps.pool.pendingAccounts {
-		if !acc.Refreshed && acc.FailCount > 0 {
-			refreshAccounts = append(refreshAccounts, acc)
-			if len(refreshAccounts) >= maxThreads {
-				break
+
+	// 如果配置了401自动删除，直接删除待续期的401账号，不下发续期任务
+	if AutoDelete401 {
+		ps.pool.mu.Lock()
+		var toDelete []*Account
+		var remaining []*Account
+		for _, acc := range ps.pool.pendingAccounts {
+			if !acc.Refreshed && acc.FailCount > 0 {
+				// 401账号，标记删除
+				toDelete = append(toDelete, acc)
+			} else {
+				remaining = append(remaining, acc)
 			}
 		}
-	}
-	ps.pool.mu.RUnlock()
-	for _, acc := range refreshAccounts {
-		logger.Info("[WS] 分配续期任务给 %s: %s", client.ID, acc.Data.Email)
-		msg := WSMessage{
-			Type:      WSMsgTaskRefresh,
-			Timestamp: time.Now().Unix(),
-			Data: map[string]interface{}{
-				"email":         acc.Data.Email,
-				"cookies":       acc.Data.Cookies,
-				"authorization": acc.Data.Authorization,
-				"config_id":     acc.ConfigID,
-				"csesidx":       acc.CSESIDX,
-			},
+		ps.pool.pendingAccounts = remaining
+		ps.pool.mu.Unlock()
+
+		// 删除401账号文件
+		for _, acc := range toDelete {
+			logger.Info("🗑️ [服务端] 401自动删除账号: %s", acc.Data.Email)
+			ps.pool.RemoveAccount(acc)
 		}
-		msgBytes, _ := json.Marshal(msg)
-		select {
-		case client.Send <- msgBytes:
-			assignedCount++
-		default:
+	} else {
+		// 未配置自动删除，分配续期任务给节点
+		// 计算401最大重试次数
+		maxRetry := MaxFailCount * 3
+		if maxRetry < 10 {
+			maxRetry = 10
+		}
+
+		ps.pool.mu.RLock()
+		var refreshAccounts []*Account
+		for _, acc := range ps.pool.pendingAccounts {
+			if !acc.Refreshed && acc.FailCount > 0 {
+				// 跳过已达上限的账号（浏览器刷新已达上限且401失败次数超过阈值）
+				if acc.BrowserRefreshCount >= BrowserRefreshMaxRetry && acc.FailCount >= maxRetry {
+					continue
+				}
+				refreshAccounts = append(refreshAccounts, acc)
+				if len(refreshAccounts) >= maxThreads {
+					break
+				}
+			}
+		}
+		ps.pool.mu.RUnlock()
+		for _, acc := range refreshAccounts {
+			logger.Info("[WS] 分配续期任务给 %s: %s", client.ID, acc.Data.Email)
+			msg := WSMessage{
+				Type:      WSMsgTaskRefresh,
+				Timestamp: time.Now().Unix(),
+				Data: map[string]interface{}{
+					"email":         acc.Data.Email,
+					"cookies":       acc.Data.Cookies,
+					"authorization": acc.Data.Authorization,
+					"config_id":     acc.ConfigID,
+					"csesidx":       acc.CSESIDX,
+				},
+			}
+			msgBytes, _ := json.Marshal(msg)
+			select {
+			case client.Send <- msgBytes:
+				assignedCount++
+			default:
+			}
 		}
 	}
 	remainingSlots := maxThreads - assignedCount
@@ -967,6 +1002,7 @@ func (rc *RemotePoolClient) RefreshJWT(email string) (*CachedAccount, error) {
 
 	return acc, nil
 }
+
 type AccountUploadRequest struct {
 	Email         string   `json:"email"`
 	FullName      string   `json:"full_name"`
@@ -975,7 +1011,7 @@ type AccountUploadRequest struct {
 	Authorization string   `json:"authorization"`
 	ConfigID      string   `json:"config_id"`
 	CSESIDX       string   `json:"csesidx"`
-	IsNew         bool     `json:"is_new"` 
+	IsNew         bool     `json:"is_new"`
 }
 
 // handleUploadAccount 处理账号上传（客户端回传鉴权文件）
@@ -1060,51 +1096,63 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	} else {
 		logger.Info("✅ 收到账号续期数据: %s", req.Email)
 	}
+
+	// 先加载文件确保账号存在
 	ps.pool.Load(dataDir)
 
-	if !req.IsNew {
-		ps.pool.mu.Lock()
-		for _, acc := range ps.pool.pendingAccounts {
-			if acc.Data.Email == req.Email {
-				acc.Data.Cookies = req.Cookies
-				acc.Data.CookieString = req.CookieString
-				acc.Data.Authorization = req.Authorization
-				acc.Data.ConfigID = req.ConfigID
-				acc.Data.CSESIDX = req.CSESIDX
-				acc.ConfigID = req.ConfigID
-				acc.CSESIDX = req.CSESIDX
-				acc.Refreshed = true
-				acc.FailCount = 0
-				acc.BrowserRefreshCount = 0
-				acc.LastRefresh = time.Now()
-				acc.JWTExpires = time.Time{}
-				ps.pool.mu.Unlock()
-				ps.pool.MarkReady(acc)
-				logger.Info("✅ [%s] 续期数据已应用，移至就绪队列", req.Email)
-				goto respond
-			}
+	// 更新内存中的账号数据
+	ps.pool.mu.Lock()
+	found := false
+
+	// 查找并更新 pending 队列
+	for i, acc := range ps.pool.pendingAccounts {
+		if acc.Data.Email == req.Email {
+			acc.Data.Cookies = req.Cookies
+			acc.Data.CookieString = req.CookieString
+			acc.Data.Authorization = req.Authorization
+			acc.Data.ConfigID = req.ConfigID
+			acc.Data.CSESIDX = req.CSESIDX
+			acc.ConfigID = req.ConfigID
+			acc.CSESIDX = req.CSESIDX
+			acc.Refreshed = true
+			acc.FailCount = 0
+			acc.BrowserRefreshCount = 0
+			acc.LastRefresh = time.Now()
+			acc.JWTExpires = time.Time{}
+			// 从 pending 移除
+			ps.pool.pendingAccounts = append(ps.pool.pendingAccounts[:i], ps.pool.pendingAccounts[i+1:]...)
+			ps.pool.mu.Unlock()
+			// 加入 ready 队列
+			ps.pool.MarkReady(acc)
+			found = true
+			goto respond
 		}
-		for _, acc := range ps.pool.readyAccounts {
-			if acc.Data.Email == req.Email {
-				acc.Mu.Lock()
-				acc.Data.Cookies = req.Cookies
-				acc.Data.CookieString = req.CookieString
-				acc.Data.Authorization = req.Authorization
-				acc.Data.ConfigID = req.ConfigID
-				acc.Data.CSESIDX = req.CSESIDX
-				acc.ConfigID = req.ConfigID
-				acc.CSESIDX = req.CSESIDX
-				acc.Refreshed = true
-				acc.FailCount = 0
-				acc.BrowserRefreshCount = 0
-				acc.LastRefresh = time.Now()
-				acc.JWTExpires = time.Time{}
-				acc.Mu.Unlock()
-				logger.Info("✅ [%s] 续期数据已更新到就绪账号", req.Email)
-				break
-			}
+	}
+
+	// 查找并更新 ready 队列
+	for _, acc := range ps.pool.readyAccounts {
+		if acc.Data.Email == req.Email {
+			acc.Mu.Lock()
+			acc.Data.Cookies = req.Cookies
+			acc.Data.CookieString = req.CookieString
+			acc.Data.Authorization = req.Authorization
+			acc.Data.ConfigID = req.ConfigID
+			acc.Data.CSESIDX = req.CSESIDX
+			acc.ConfigID = req.ConfigID
+			acc.CSESIDX = req.CSESIDX
+			acc.FailCount = 0
+			acc.BrowserRefreshCount = 0
+			acc.LastRefresh = time.Now()
+			acc.JWTExpires = time.Time{}
+			acc.Mu.Unlock()
+			found = true
+			break
 		}
-		ps.pool.mu.Unlock()
+	}
+	ps.pool.mu.Unlock()
+
+	if !found {
+		logger.Warn("⚠️ [%s] 账号已保存但未在内存中找到", req.Email)
 	}
 
 respond:

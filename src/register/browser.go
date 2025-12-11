@@ -30,6 +30,7 @@ var (
 	RegisterOnce  bool
 	httpClient    *http.Client
 	GetProxy      func() string
+	ReleaseProxy  func(proxyURL string) // 释放代理的函数
 	firstNames    = []string{"John", "Jane", "Michael", "Sarah", "David", "Emily", "Robert", "Lisa", "James", "Emma"}
 	lastNames     = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Wilson", "Taylor"}
 	commonWords   = map[string]bool{
@@ -194,8 +195,6 @@ func getEmailCount(email string) int {
 			time.Sleep(time.Second)
 			continue
 		}
-		defer resp.Body.Close()
-
 		body, _ := readResponseBody(resp)
 		var result EmailListResponse
 		if err := json.Unmarshal(body, &result); err != nil {
@@ -271,8 +270,7 @@ func getVerificationEmailWithState(email string, retries int, intervalSec int, i
 			time.Sleep(time.Duration(intervalSec) * time.Second)
 			continue
 		}
-		body, _ := readResponseBody(resp)
-		resp.Body.Close()
+		body, _ := readResponseBody(resp) // readResponseBody 内部会关闭 Body
 
 		var result EmailListResponse
 		if err := json.Unmarshal(body, &result); err != nil {
@@ -2044,9 +2042,16 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 	}
 
-	// 记录最终获取的值
-	log.Printf("[注册 %d] 📋 最终结果: configID=%s, csesidx=%s, auth长度=%d",
-		threadID, configID, csesidx, len(authorization))
+	// 如果 csesidx 为空，尝试从 authorization 提取
+	if csesidx == "" && authorization != "" {
+		csesidx = extractCSESIDXFromAuth(authorization)
+	}
+
+	// csesidx 是必须的，没有则注册失败
+	if csesidx == "" {
+		result.Error = fmt.Errorf("未能获取 csesidx")
+		return result
+	}
 
 	result.Success = true
 	result.Authorization = authorization
@@ -2504,9 +2509,16 @@ extractResult:
 		}
 	}
 
-	// 记录最终获取的值
-	log.Printf("[Cookie刷新] [%s] 📋 最终结果: configID=%s, csesidx=%s, auth长度=%d",
-		email, configID, csesidx, len(authorization))
+	// 如果 csesidx 为空，尝试从 authorization 提取
+	if csesidx == "" && authorization != "" {
+		csesidx = extractCSESIDXFromAuth(authorization)
+	}
+
+	// csesidx 是必须的
+	if csesidx == "" {
+		result.Error = fmt.Errorf("未能获取 csesidx")
+		return result
+	}
 
 	result.Success = true
 	result.Authorization = authorization
@@ -2514,7 +2526,6 @@ extractResult:
 	result.ConfigID = configID
 	result.CSESIDX = csesidx
 
-	log.Printf("[Cookie刷新] ✅ [%s] 刷新成功", email)
 	return result
 }
 
@@ -2570,6 +2581,11 @@ func NativeRegisterWorker(id int, dataDirAbs string) {
 		logger.Debug("[注册线程 %d] 启动注册任务, 代理: %s", id, currentProxy)
 
 		result := RunBrowserRegister(Headless, currentProxy, id)
+
+		// 释放代理
+		if ReleaseProxy != nil && currentProxy != "" && currentProxy != Proxy {
+			ReleaseProxy(currentProxy)
+		}
 
 		if result.Success {
 			if err := SaveBrowserRegisterResult(result, dataDirAbs); err != nil {
