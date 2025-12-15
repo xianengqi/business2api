@@ -4,24 +4,53 @@
 
 [![Build](https://github.com/XxxXTeam/business2api/actions/workflows/build.yml/badge.svg)](https://github.com/XxxXTeam/business2api/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://golang.org)
 
 ## ✨ 功能特性
 
-- 🔌 **多 API 兼容** - 支持 OpenAI (`/v1/chat/completions`)、Gemini (`/v1beta/models`)、Claude (`/v1/messages`) 格式
-- 🏊 **账号池管理** - 自动轮询、刷新、维护多个 Gemini Business 账号
-- 🌊 **流式响应** - 支持 SSE 流式输出
-- 🎨 **多模态支持** - 支持图片、视频输入和生成
-- 🤖 **自动注册** - 浏览器自动化注册新账号
-- 🌐 **代理支持** - 支持 HTTP/SOCKS5 代理
+| 功能 | 描述 |
+|------|------|
+| 🔌 **多 API 兼容** | OpenAI (`/v1/chat/completions`)、Gemini (`/v1beta/models`)、Claude (`/v1/messages`) |
+| 🏊 **智能账号池** | 自动轮询、刷新、冷却管理、401/403 自动换号 |
+| 🌊 **流式响应** | SSE 流式输出，支持 `stream: true` |
+| 🎨 **多模态** | 图片/视频输入、原生图片生成（`-image` 后缀）|
+| 🤖 **自动注册** | 浏览器自动化注册，支持 Windows/Linux/macOS |
+| 🌐 **代理池** | HTTP/SOCKS5 代理，订阅链接，健康检查 |
+| 📊 **遥测监控** | IP 请求统计、Token 使用量、RPM 监控 |
+| 🔄 **热重载** | 配置文件自动监听，无需重启 |
 
 ## 📦 支持的模型
 
-### Gemini 文本/多模态
 | 模型 | 文本 | 图片生成 | 视频生成 | 搜索 |
-|------|------|----------|----------|------|
+|------|:----:|:--------:|:--------:|:----:|
 | gemini-2.5-flash | ✅ | ✅ | ✅ | ✅ |
 | gemini-2.5-pro | ✅ | ✅ | ✅ | ✅ |
 | gemini-3-pro-preview | ✅ | ✅ | ✅ | ✅ |
+| gemini-3-pro | ✅ | ✅ | ✅ | ✅ |
+
+### 功能后缀
+
+支持单个或混合后缀启用指定功能：
+
+| 后缀 | 功能 | 示例 |
+|------|------|------|
+| `-image` | 图片生成 | `gemini-2.5-flash-image` |
+| `-video` | 视频生成 | `gemini-2.5-flash-video` |
+| `-search` | 联网搜索 | `gemini-2.5-flash-search` |
+| 混合后缀 | 同时启用多功能 | `gemini-2.5-flash-image-search` |
+
+**说明：**
+- 无后缀：启用所有功能（图片/视频/搜索/工具）
+- 有后缀：只启用指定功能，支持任意组合如 `-image-search`、`-video-search`
+
+### ⚠️ 限制说明
+
+| 限制 | 说明 |
+|------|------|
+| **不支持自定义工具** | Function Calling / Tools 参数会被忽略，仅支持内置工具（图片/视频生成、搜索） |
+| **上下文拼接实现** | 多轮对话通过拼接 `messages` 为单次请求实现，非原生会话管理 |
+| **无状态** | 每次请求独立，不保留会话状态，历史消息需客户端自行维护 |
+
 ---
 
 
@@ -177,6 +206,43 @@ sudo systemctl start business2api
     "check_on_startup": true           // 启动时检查
   }
 }
+```
+
+### 多 API Key 支持
+
+支持配置多个 API Key，所有 Key 都可以用于鉴权：
+
+```json
+{
+  "api_keys": [
+    "sk-key-1",
+    "sk-key-2", 
+    "sk-key-3"
+  ]
+}
+```
+
+### 配置热重载
+
+服务运行时自动监听 `config/config.json` 文件变更，无需重启即可生效。
+
+**可热重载的配置项：**
+
+| 配置项 | 说明 |
+|----------|------|
+| `api_keys` | API 密钥列表 |
+| `debug` | 调试模式 |
+| `pool.refresh_cooldown_sec` | 刷新冷却时间 |
+| `pool.use_cooldown_sec` | 使用冷却时间 |
+| `pool.max_fail_count` | 最大失败次数 |
+| `pool.enable_browser_refresh` | 浏览器刷新开关 | 
+
+**配置合并机制：** 配置文件中缺失的字段会自动使用默认值，无需手动同步示例文件。
+
+```bash
+# 手动触发重载
+curl -X POST http://localhost:8000/admin/reload-config \
+  -H "Authorization: Bearer sk-your-api-key"
 ```
 
 ---
@@ -430,20 +496,37 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## 📡 API 端点一览
 
+### 公开端点
+
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/` | GET | 服务状态和信息 |
 | `/health` | GET | 健康检查 |
 | `/ws` | WS | WebSocket 端点 (Server 模式) |
+
+### API 端点（需要 API Key）
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
 | `/v1/models` | GET | OpenAI 格式模型列表 |
 | `/v1/chat/completions` | POST | OpenAI 格式聊天补全 |
 | `/v1/messages` | POST | Claude 格式消息 |
 | `/v1beta/models` | GET | Gemini 格式模型列表 |
 | `/v1beta/models/:model` | GET | Gemini 格式模型详情 |
 | `/v1beta/models/:model:generateContent` | POST | Gemini 格式生成内容 |
-| `/admin/status` | GET | 管理状态 |
+
+### 管理端点（需要 API Key）
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/admin/status` | GET | 账号池状态 |
+| `/admin/stats` | GET | 详细 API 统计 |
+| `/admin/ip` | GET | IP 遥测统计（请求数/Token/RPM） |
 | `/admin/register` | POST | 触发注册 |
 | `/admin/refresh` | POST | 刷新账号池 |
+| `/admin/reload-config` | POST | 热重载配置文件 |
+| `/admin/force-refresh` | POST | 强制刷新所有账号 |
+| `/admin/config/cooldown` | POST | 动态调整冷却时间 |
 
 ---
 
@@ -465,15 +548,19 @@ go run . -d
 ### 构建
 
 ```bash
-# 构建二进制
-CGO_ENABLED=0 go build -ldflags="-s -w" -o business2api .
+# 标准构建
+go build -o business2api .
 
-# 构建 Docker 镜像
-docker build -t business2api .
+# 带 QUIC/uTLS 支持（推荐）
+go build -tags "with_quic with_utls" -o business2api .
+
+# 生产构建（压缩体积）
+CGO_ENABLED=0 go build -ldflags="-s -w" -tags "with_quic with_utls" -o business2api .
 
 # 多平台构建
-GOOS=linux GOARCH=amd64 go build -o business2api-linux-amd64 .
-GOOS=darwin GOARCH=arm64 go build -o business2api-darwin-arm64 .
+GOOS=linux GOARCH=amd64 go build -tags "with_quic with_utls" -o business2api-linux-amd64 .
+GOOS=windows GOARCH=amd64 go build -tags "with_quic with_utls" -o business2api-windows-amd64.exe .
+GOOS=darwin GOARCH=arm64 go build -tags "with_quic with_utls" -o business2api-darwin-arm64 .
 ```
 
 ### 项目结构
@@ -498,6 +585,31 @@ GOOS=darwin GOARCH=arm64 go build -o business2api-darwin-arm64 .
 
 ---
 
-## 📄 License
+## � IP 遥测接口
+
+访问 `/admin/ip` 获取全部 IP 请求统计：
+
+```bash
+curl http://localhost:8000/admin/ip \
+  -H "Authorization: Bearer sk-your-api-key"
+```
+
+**返回字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `unique_ips` | 独立 IP 数量 |
+| `total_requests` | 总请求数 |
+| `total_tokens` | 总 Token 消耗 |
+| `total_images` | 图片生成数 |
+| `total_videos` | 视频生成数 |
+| `ips[].rpm` | 单 IP 每分钟请求数 |
+| `ips[].input_tokens` | 输入 Token |
+| `ips[].output_tokens` | 输出 Token |
+| `ips[].models` | 各模型使用次数 |
+
+---
+
+## �📄 License
 
 MIT License

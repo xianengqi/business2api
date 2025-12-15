@@ -6,7 +6,6 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.9.1
 	github.com/go-rod/rod v0.116.2
-	github.com/go-rod/stealth v0.4.9
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/sagernet/sing-box v1.12.12

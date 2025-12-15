@@ -25,11 +25,11 @@ var (
 )
 
 var IsRegistering int32
+var registeringTarget int32 // 正在注册的目标数量
+var registerMu sync.Mutex   // 注册启动互斥锁
 
-// Stats 注册统计（导出）
 var Stats = &RegisterStats{}
 
-// 注册统计
 type RegisterStats struct {
 	Total     int       `json:"total"`
 	Success   int       `json:"success"`
@@ -76,16 +76,41 @@ type RegisterResult struct {
 	NeedWait bool   `json:"needWait"`
 }
 
-// StartRegister 启动注册任务
+// StartRegister 启动注册任务（优化并发控制）
 func StartRegister(count int) error {
+	registerMu.Lock()
+	defer registerMu.Unlock()
+
+	// 再次检查当前账号数是否已满足
+	pool.Pool.Load(DataDir)
+	currentCount := pool.Pool.TotalCount()
+	if currentCount >= TargetCount {
+		logger.Info("✅ 账号数已满足: %d >= %d，无需注册", currentCount, TargetCount)
+		return nil
+	}
+
+	// 如果已经在注册中，检查是否需要调整
+	if atomic.LoadInt32(&IsRegistering) == 1 {
+		currentTarget := atomic.LoadInt32(&registeringTarget)
+		if int(currentTarget) >= count {
+			return fmt.Errorf("注册进程已在运行，目标: %d", currentTarget)
+		}
+		// 更新目标数量
+		atomic.StoreInt32(&registeringTarget, int32(count))
+		logger.Info("🔄 注册目标已更新: %d", count)
+		return nil
+	}
+
 	if !atomic.CompareAndSwapInt32(&IsRegistering, 0, 1) {
 		return fmt.Errorf("注册进程已在运行")
 	}
+	atomic.StoreInt32(&registeringTarget, int32(count))
 
 	// 获取数据目录的绝对路径
 	dataDirAbs, _ := filepath.Abs(DataDir)
 	if err := os.MkdirAll(dataDirAbs, 0755); err != nil {
 		atomic.StoreInt32(&IsRegistering, 0)
+		atomic.StoreInt32(&registeringTarget, 0)
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
@@ -103,9 +128,19 @@ func StartRegister(count int) error {
 		for {
 			time.Sleep(10 * time.Second)
 			pool.Pool.Load(DataDir)
-			if pool.Pool.TotalCount() >= TargetCount {
-				logger.Info("✅ 已达到目标账号数: %d，停止注册", pool.Pool.TotalCount())
+			currentCount := pool.Pool.TotalCount()
+			target := atomic.LoadInt32(&registeringTarget)
+
+			// 检查是否达到目标（使用当前目标和全局目标的较大值）
+			effectiveTarget := TargetCount
+			if int(target) > effectiveTarget {
+				effectiveTarget = int(target)
+			}
+
+			if currentCount >= effectiveTarget {
+				logger.Info("✅ 已达到目标账号数: %d >= %d，停止注册", currentCount, effectiveTarget)
 				atomic.StoreInt32(&IsRegistering, 0)
+				atomic.StoreInt32(&registeringTarget, 0)
 				return
 			}
 		}
@@ -130,8 +165,14 @@ func PoolMaintainer() {
 	}
 }
 
-// CheckAndMaintainPool 检查并维护号池
+// CheckAndMaintainPool 检查并维护号池（优化并发控制）
 func CheckAndMaintainPool() {
+	// 如果正在注册中，跳过检查
+	if atomic.LoadInt32(&IsRegistering) == 1 {
+		logger.Debug("⏳ 注册进程运行中，跳过本次检查")
+		return
+	}
+
 	pool.Pool.Load(DataDir)
 
 	readyCount := pool.Pool.ReadyCount()
@@ -141,11 +182,14 @@ func CheckAndMaintainPool() {
 	logger.Info("📊 号池检查: ready=%d, pending=%d, total=%d, 目标=%d, 最小=%d",
 		readyCount, pendingCount, totalCount, TargetCount, MinCount)
 
-	if totalCount < TargetCount {
+	// 只有当总数小于最小数时才触发注册，避免频繁注册
+	if totalCount < MinCount {
 		needCount := TargetCount - totalCount
-		logger.Info("⚠️ 账号数未达目标，需要注册 %d 个", needCount)
+		logger.Info("⚠️ 账号数低于最小值 (%d < %d)，需要注册 %d 个", totalCount, MinCount, needCount)
 		if err := StartRegister(needCount); err != nil {
 			logger.Error("❌ 启动注册失败: %v", err)
 		}
+	} else if totalCount < TargetCount {
+		logger.Debug("📊 账号数未达目标 (%d < %d)，但高于最小值，暂不触发注册", totalCount, TargetCount)
 	}
 }

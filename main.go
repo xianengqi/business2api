@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -23,6 +24,7 @@ import (
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
@@ -103,6 +105,13 @@ var (
 	flowTokenPool    *flow.TokenPool
 )
 
+// 配置热重载相关
+var (
+	configMu      sync.RWMutex           // 配置读写锁
+	configWatcher *fsnotify.Watcher      // 配置文件监听器
+	configPath    = "config/config.json" // 配置文件路径
+)
+
 // APIStats API 调用统计
 type APIStats struct {
 	mu              sync.RWMutex
@@ -143,6 +152,164 @@ var apiStats = &APIStats{
 	requestTimes: make([]time.Time, 0, 1000),
 	modelStats:   make(map[string]*ModelStats),
 	lastHour:     time.Now().Hour(),
+}
+
+// IPStats IP请求统计
+type IPStats struct {
+	mu         sync.RWMutex
+	ipRequests map[string]*IPRequestInfo
+}
+
+// IPRequestInfo 单个IP的请求信息
+type IPRequestInfo struct {
+	IP           string           `json:"ip"`
+	TotalCount   int64            `json:"total_count"`
+	SuccessCount int64            `json:"success_count"`
+	FailedCount  int64            `json:"failed_count"`
+	InputTokens  int64            `json:"input_tokens"`
+	OutputTokens int64            `json:"output_tokens"`
+	ImagesCount  int64            `json:"images_count"`
+	VideosCount  int64            `json:"videos_count"`
+	FirstSeen    time.Time        `json:"first_seen"`
+	LastSeen     time.Time        `json:"last_seen"`
+	RequestTimes []time.Time      `json:"-"` // 用于计算RPM
+	Models       map[string]int64 `json:"models"`
+	UserAgents   map[string]int64 `json:"user_agents,omitempty"`
+}
+
+var ipStats = &IPStats{
+	ipRequests: make(map[string]*IPRequestInfo),
+}
+
+// RecordIPRequest 记录IP请求（包含tokens、图片、视频统计）
+func (s *IPStats) RecordIPRequest(ip, model, userAgent string, success bool, inputTokens, outputTokens, images, videos int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	info, exists := s.ipRequests[ip]
+	if !exists {
+		info = &IPRequestInfo{
+			IP:           ip,
+			FirstSeen:    now,
+			Models:       make(map[string]int64),
+			UserAgents:   make(map[string]int64),
+			RequestTimes: make([]time.Time, 0, 100),
+		}
+		s.ipRequests[ip] = info
+	}
+
+	info.TotalCount++
+	info.LastSeen = now
+	info.InputTokens += inputTokens
+	info.OutputTokens += outputTokens
+	info.ImagesCount += images
+	info.VideosCount += videos
+
+	// 记录请求时间用于计算RPM（保留最近100条）
+	info.RequestTimes = append(info.RequestTimes, now)
+	if len(info.RequestTimes) > 100 {
+		info.RequestTimes = info.RequestTimes[len(info.RequestTimes)-100:]
+	}
+
+	if success {
+		info.SuccessCount++
+	} else {
+		info.FailedCount++
+	}
+	if model != "" {
+		info.Models[model]++
+	}
+	if userAgent != "" && len(info.UserAgents) < 50 {
+		info.UserAgents[userAgent]++
+	}
+}
+
+// GetIPRPM 计算单个IP的RPM
+func (info *IPRequestInfo) GetRPM() float64 {
+	oneMinuteAgo := time.Now().Add(-time.Minute)
+	count := 0
+	for i := len(info.RequestTimes) - 1; i >= 0; i-- {
+		if info.RequestTimes[i].After(oneMinuteAgo) {
+			count++
+		} else {
+			break
+		}
+	}
+	return float64(count)
+}
+
+func (s *IPStats) GetAllIPStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type ipSortInfo struct {
+		IP    string
+		Count int64
+	}
+	sorted := make([]ipSortInfo, 0, len(s.ipRequests))
+	for ip, info := range s.ipRequests {
+		sorted = append(sorted, ipSortInfo{IP: ip, Count: info.TotalCount})
+	}
+	n := len(sorted)
+	for i := 1; i < n; i++ {
+		for j := i; j > 0 && sorted[j].Count > sorted[j-1].Count; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	var totalRequests, totalSuccess, totalFailed int64
+	var totalInputTokens, totalOutputTokens int64
+	var totalImages, totalVideos int64
+	ips := make([]map[string]interface{}, 0, n)
+	for i := 0; i < n; i++ {
+		info := s.ipRequests[sorted[i].IP]
+		rpm := info.GetRPM()
+		totalRequests += info.TotalCount
+		totalSuccess += info.SuccessCount
+		totalFailed += info.FailedCount
+		totalInputTokens += info.InputTokens
+		totalOutputTokens += info.OutputTokens
+		totalImages += info.ImagesCount
+		totalVideos += info.VideosCount
+
+		ips = append(ips, map[string]interface{}{
+			"ip":            info.IP,
+			"total_count":   info.TotalCount,
+			"success_count": info.SuccessCount,
+			"failed_count":  info.FailedCount,
+			"success_rate":  fmt.Sprintf("%.1f%%", float64(info.SuccessCount)/float64(max(info.TotalCount, 1))*100),
+			"input_tokens":  info.InputTokens,
+			"output_tokens": info.OutputTokens,
+			"total_tokens":  info.InputTokens + info.OutputTokens,
+			"images":        info.ImagesCount,
+			"videos":        info.VideosCount,
+			"rpm":           rpm,
+			"first_seen":    info.FirstSeen.Format(time.RFC3339),
+			"last_seen":     info.LastSeen.Format(time.RFC3339),
+			"models":        info.Models,
+			"user_agents":   info.UserAgents,
+		})
+	}
+
+	return map[string]interface{}{
+		"server_time":         time.Now().Format(time.RFC3339),
+		"unique_ips":          n,
+		"total_requests":      totalRequests,
+		"total_success":       totalSuccess,
+		"total_failed":        totalFailed,
+		"total_input_tokens":  totalInputTokens,
+		"total_output_tokens": totalOutputTokens,
+		"total_tokens":        totalInputTokens + totalOutputTokens,
+		"total_images":        totalImages,
+		"total_videos":        totalVideos,
+		"ips":                 ips,
+	}
+}
+
+// GetIPDetail 获取单个IP的详细信息
+func (s *IPStats) GetIPDetail(ip string) *IPRequestInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ipRequests[ip]
 }
 
 // RecordRequest 记录请求
@@ -203,7 +370,6 @@ func (s *APIStats) RecordRequestWithModel(model string, success bool, inputToken
 	hs.OutputTokens += outputTokens
 }
 
-// GetRPM 计算最近一分钟的 RPM
 func (s *APIStats) GetRPM() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -332,6 +498,158 @@ var appConfig = AppConfig{
 		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
 	},
 }
+
+// GetAPIKeys 线程安全获取 API Keys
+func GetAPIKeys() []string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	keys := make([]string, len(appConfig.APIKeys))
+	copy(keys, appConfig.APIKeys)
+	return keys
+}
+
+// reloadConfig 重新加载配置文件（热重载）
+func reloadConfig() error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	var newConfig AppConfig
+	if err := json.Unmarshal(data, &newConfig); err != nil {
+		return fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+	configMu.Lock()
+	oldAPIKeys := appConfig.APIKeys
+	oldDebug := appConfig.Debug
+	oldPoolConfig := appConfig.Pool
+
+	// 更新可热重载的配置项
+	appConfig.APIKeys = newConfig.APIKeys
+	appConfig.Debug = newConfig.Debug
+	appConfig.Note = newConfig.Note
+
+	// 更新号池配置
+	appConfig.Pool.RefreshCooldownSec = newConfig.Pool.RefreshCooldownSec
+	appConfig.Pool.UseCooldownSec = newConfig.Pool.UseCooldownSec
+	appConfig.Pool.MaxFailCount = newConfig.Pool.MaxFailCount
+	appConfig.Pool.EnableBrowserRefresh = newConfig.Pool.EnableBrowserRefresh
+	appConfig.Pool.BrowserRefreshHeadless = newConfig.Pool.BrowserRefreshHeadless
+	appConfig.Pool.BrowserRefreshMaxRetry = newConfig.Pool.BrowserRefreshMaxRetry
+	appConfig.Pool.AutoDelete401 = newConfig.Pool.AutoDelete401
+	configMu.Unlock()
+
+	// 应用变更
+	applyConfigChanges(oldAPIKeys, oldDebug, oldPoolConfig, newConfig)
+
+	return nil
+}
+
+// applyConfigChanges 应用配置变更
+func applyConfigChanges(oldAPIKeys []string, oldDebug bool, oldPoolConfig PoolConfig, newConfig AppConfig) {
+	// 日志模式变更
+	if oldDebug != newConfig.Debug {
+		logger.SetDebugMode(newConfig.Debug)
+		logger.Info("🔄 调试模式: %v -> %v", oldDebug, newConfig.Debug)
+	}
+
+	// API Keys 变更
+	if len(oldAPIKeys) != len(newConfig.APIKeys) {
+		logger.Info("🔄 API Keys 数量: %d -> %d", len(oldAPIKeys), len(newConfig.APIKeys))
+	}
+
+	// 号池配置变更
+	if oldPoolConfig.RefreshCooldownSec != newConfig.Pool.RefreshCooldownSec ||
+		oldPoolConfig.UseCooldownSec != newConfig.Pool.UseCooldownSec {
+		pool.SetCooldowns(newConfig.Pool.RefreshCooldownSec, newConfig.Pool.UseCooldownSec)
+		logger.Info("🔄 冷却配置已更新: refresh=%ds, use=%ds",
+			newConfig.Pool.RefreshCooldownSec, newConfig.Pool.UseCooldownSec)
+	}
+
+	if newConfig.Pool.MaxFailCount > 0 {
+		pool.MaxFailCount = newConfig.Pool.MaxFailCount
+	}
+
+	pool.EnableBrowserRefresh = newConfig.Pool.EnableBrowserRefresh
+	pool.BrowserRefreshHeadless = newConfig.Pool.BrowserRefreshHeadless
+	if newConfig.Pool.BrowserRefreshMaxRetry >= 0 {
+		pool.BrowserRefreshMaxRetry = newConfig.Pool.BrowserRefreshMaxRetry
+	}
+	pool.AutoDelete401 = newConfig.Pool.AutoDelete401
+
+	logger.Info("✅ 配置热重载完成")
+}
+
+// startConfigWatcher 启动配置文件监听
+func startConfigWatcher() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("创建配置监听器失败: %w", err)
+	}
+	configWatcher = watcher
+
+	go configWatchLoop()
+
+	// 监听配置目录
+	configDir := filepath.Dir(configPath)
+	if err := watcher.Add(configDir); err != nil {
+		return fmt.Errorf("添加配置目录监听失败: %w", err)
+	}
+
+	logger.Info("🔄 配置文件热重载已启用: %s", configPath)
+	return nil
+}
+
+// configWatchLoop 配置文件监听循环
+func configWatchLoop() {
+	var lastReload time.Time
+	const debounceDelay = 500 * time.Millisecond
+
+	for {
+		select {
+		case event, ok := <-configWatcher.Events:
+			if !ok {
+				return
+			}
+			// 只关注配置文件
+			if filepath.Base(event.Name) != "config.json" {
+				continue
+			}
+			// 只处理写入和创建事件
+			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+				continue
+			}
+			// 防抖：避免短时间内多次触发
+			if time.Since(lastReload) < debounceDelay {
+				continue
+			}
+			lastReload = time.Now()
+
+			// 等待文件写入完成
+			time.Sleep(100 * time.Millisecond)
+
+			logger.Info("📝 检测到配置文件变更，正在重载...")
+			if err := reloadConfig(); err != nil {
+				logger.Error("❌ 配置重载失败: %v", err)
+			}
+
+		case err, ok := <-configWatcher.Errors:
+			if !ok {
+				return
+			}
+			logger.Error("❌ 配置监听错误: %v", err)
+		}
+	}
+}
+
+// stopConfigWatcher 停止配置文件监听
+func stopConfigWatcher() {
+	if configWatcher != nil {
+		configWatcher.Close()
+	}
+}
+
 var (
 	DataDir       string
 	Proxy         string
@@ -339,6 +657,72 @@ var (
 	DefaultConfig string
 	JwtTTL        = 270 * time.Second
 )
+
+// mergeConfig 合并配置：loaded 中有值的字段覆盖 base 中的默认值
+func mergeConfig(base, loaded *AppConfig) {
+	// 基本字段
+	if len(loaded.APIKeys) > 0 {
+		base.APIKeys = loaded.APIKeys
+	}
+	if loaded.ListenAddr != "" {
+		base.ListenAddr = loaded.ListenAddr
+	}
+	if loaded.DataDir != "" {
+		base.DataDir = loaded.DataDir
+	}
+	if loaded.Proxy != "" {
+		base.Proxy = loaded.Proxy
+	}
+	if loaded.DefaultConfig != "" {
+		base.DefaultConfig = loaded.DefaultConfig
+	}
+	// Debug 是 bool，直接覆盖
+	base.Debug = loaded.Debug
+
+	// Pool 配置
+	if loaded.Pool.TargetCount > 0 {
+		base.Pool.TargetCount = loaded.Pool.TargetCount
+	}
+	if loaded.Pool.MinCount > 0 {
+		base.Pool.MinCount = loaded.Pool.MinCount
+	}
+	if loaded.Pool.CheckIntervalMinutes > 0 {
+		base.Pool.CheckIntervalMinutes = loaded.Pool.CheckIntervalMinutes
+	}
+	if loaded.Pool.RegisterThreads > 0 {
+		base.Pool.RegisterThreads = loaded.Pool.RegisterThreads
+	}
+	// bool 字段直接覆盖
+	base.Pool.RegisterHeadless = loaded.Pool.RegisterHeadless
+	base.Pool.RefreshOnStartup = loaded.Pool.RefreshOnStartup
+	base.Pool.EnableBrowserRefresh = loaded.Pool.EnableBrowserRefresh
+	base.Pool.BrowserRefreshHeadless = loaded.Pool.BrowserRefreshHeadless
+	base.Pool.AutoDelete401 = loaded.Pool.AutoDelete401
+
+	if loaded.Pool.RefreshCooldownSec > 0 {
+		base.Pool.RefreshCooldownSec = loaded.Pool.RefreshCooldownSec
+	}
+	if loaded.Pool.UseCooldownSec > 0 {
+		base.Pool.UseCooldownSec = loaded.Pool.UseCooldownSec
+	}
+	if loaded.Pool.MaxFailCount > 0 {
+		base.Pool.MaxFailCount = loaded.Pool.MaxFailCount
+	}
+	if loaded.Pool.BrowserRefreshMaxRetry > 0 {
+		base.Pool.BrowserRefreshMaxRetry = loaded.Pool.BrowserRefreshMaxRetry
+	}
+
+	// PoolServer 配置
+	base.PoolServer = loaded.PoolServer
+
+	// Flow 配置
+	base.Flow = loaded.Flow
+
+	// Note
+	if len(loaded.Note) > 0 {
+		base.Note = loaded.Note
+	}
+}
 
 // 保存默认配置到文件
 func saveDefaultConfig(configPath string) error {
@@ -358,9 +742,13 @@ func loadAppConfig() {
 	// 尝试加载配置文件
 	configPath := "config/config.json"
 	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, &appConfig); err != nil {
+		// 保留默认值，仅覆盖配置文件中存在的字段
+		var loadedConfig AppConfig
+		if err := json.Unmarshal(data, &loadedConfig); err != nil {
 			logger.Warn("⚠️ 解析配置文件失败: %v，使用默认配置", err)
 		} else {
+			// 合并配置：配置文件中有的字段覆盖默认值，没有的保留默认值
+			mergeConfig(&appConfig, &loadedConfig)
 			logger.Info("✅ 加载配置文件: %s", configPath)
 		}
 	} else if os.IsNotExist(err) {
@@ -949,7 +1337,7 @@ func createChunk(id string, created int64, model string, delta map[string]interf
 	return string(data)
 }
 
-func extractContentFromReply(replyMap map[string]interface{}, jwt, session, configID, origAuth string) (text string, imageData string, imageMime string, reasoning string) {
+func extractContentFromReply(replyMap map[string]interface{}, jwt, session, configID, origAuth string) (text string, imageData string, imageMime string, reasoning string, downloadErr error) {
 	groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
 	if !ok {
 		return
@@ -988,6 +1376,7 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 			data, err := downloadGeneratedFile(jwt, fileId, session, configID, origAuth)
 			if err != nil {
 				logger.Error("❌ 下载%s失败: %v", fileType, err)
+				downloadErr = err // 返回错误供上层处理
 			} else {
 				imageData = data
 				imageMime = mimeType
@@ -997,9 +1386,14 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 
 	return
 }
+
+// ErrDownloadNeedsRetry 标识下载失败需要整体重试（换号重新生成）
+var ErrDownloadNeedsRetry = fmt.Errorf("DOWNLOAD_NEEDS_RETRY")
+
 func downloadGeneratedFile(jwt, fileId, session, configID, origAuth string) (string, error) {
-	return downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth, 3)
+	return downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth, 2)
 }
+
 func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth string, maxRetries int) (string, error) {
 	// 参数验证
 	if jwt == "" {
@@ -1012,11 +1406,10 @@ func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth str
 		return "", fmt.Errorf("configID 为空，无法下载文件")
 	}
 	var lastErr error
-	currentJWT := jwt
-	currentOrigAuth := origAuth
+	var authFailCount int
 
 	for retry := 0; retry < maxRetries; retry++ {
-		result, err := downloadGeneratedFileOnce(currentJWT, fileId, session, configID, currentOrigAuth)
+		result, err := downloadGeneratedFileOnce(jwt, fileId, session, configID, origAuth)
 		if err == nil {
 			return result, nil
 		}
@@ -1024,26 +1417,23 @@ func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth str
 		lastErr = err
 		errMsg := err.Error()
 
+		// 检测认证失败（401/403）
 		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "403") ||
 			strings.Contains(errMsg, "UNAUTHENTICATED") || strings.Contains(errMsg, "SESSION_COOKIE_INVALID") {
-			logger.Warn("⚠️ 下载文件认证失败 (尝试 %d/%d): %v，尝试切换账号...", retry+1, maxRetries, err)
-			newAcc := pool.Pool.Next()
-			if newAcc != nil {
-				newJWT, newConfigID, jwtErr := newAcc.GetJWT()
-				if jwtErr == nil {
-					logger.Info("✅ 切换到新账号: %s", newAcc.Data.Email)
-					currentJWT = newJWT
-					currentOrigAuth = newAcc.Data.Authorization
-					_ = newConfigID
-					continue
-				}
+			authFailCount++
+			logger.Warn("⚠️ 下载文件认证失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
+
+			// 认证失败超过1次，返回特殊错误让上层重新发起整个请求
+			if authFailCount >= 1 {
+				logger.Info("🔄 下载认证失败，需要换号重新生成")
+				return "", fmt.Errorf("%w: 401/403 认证失败", ErrDownloadNeedsRetry)
 			}
-			logger.Error("❌ 无法获取新账号，重试当前账号...")
+			continue
 		}
 
 		// 其他错误，等待后重试
 		logger.Error("❌ 下载文件失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	return "", fmt.Errorf("下载文件失败，已重试 %d 次: %w", maxRetries, lastErr)
@@ -1643,27 +2033,29 @@ func handleClaudeMessages(c *gin.Context) {
 }
 
 // buildToolsSpec 将OpenAI格式的工具定义转换为Gemini的toolsSpec
+// 支持混合后缀同时启用多个功能，如 -image-search 同时启用图片生成和搜索
 func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel, isSearchModel bool) map[string]interface{} {
 	toolsSpec := make(map[string]interface{})
 
-	// 基础工具
-	if isImageModel {
-		toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
-	} else if isVideoModel {
-		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
-	} else if isSearchModel {
-		// 搜索模型只启用 webGroundingSpec
-		toolsSpec["webGroundingSpec"] = map[string]interface{}{}
-	} else {
-		// 普通模型启用所有内置工具
+	// 检查是否指定了任何功能后缀
+	hasAnySpec := isImageModel || isVideoModel || isSearchModel
+
+	if !hasAnySpec {
 		toolsSpec["webGroundingSpec"] = map[string]interface{}{}
 		toolsSpec["toolRegistry"] = "default_tool_registry"
 		toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
 		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
+	} else {
+		if isImageModel {
+			toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
+		}
+		if isVideoModel {
+			toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
+		}
+		if isSearchModel {
+			toolsSpec["webGroundingSpec"] = map[string]interface{}{}
+		}
 	}
-
-	// 注意: Google stream_assist_request.tools_spec 不支持 functionDeclarations 字段
-	// 自定义工具暂不支持，忽略 tools 参数
 	_ = tools
 
 	return toolsSpec
@@ -1854,6 +2246,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	chatID := "chatcmpl-" + uuid.New().String()
 	createdTime := time.Now().Unix()
 	clientIP := c.ClientIP()
+	userAgent := c.GetHeader("User-Agent")
 
 	// 统计变量
 	var statsSuccess bool
@@ -1864,20 +2257,18 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	statsModel := req.Model
 	defer func() {
 		apiStats.RecordRequestWithModel(statsModel, statsSuccess, statsInputTokens, statsOutputTokens, statsImages, statsVideos)
+		// 记录IP统计（包含tokens、图片、视频）
+		ipStats.RecordIPRequest(clientIP, statsModel, userAgent, statsSuccess, statsInputTokens, statsOutputTokens, statsImages, statsVideos)
 	}()
 
 	// 入站日志
 	logger.Info("📥 [%s] 请求: model=%s ", clientIP, req.Model)
-
-	// 检查是否是 Flow 模型
 	if flow.IsFlowModel(req.Model) {
 		handleFlowRequest(c, req, chatID, createdTime)
 		return
 	}
-	// 解析消息：支持多轮对话拼接和系统提示词
 	var textContent string
 	var images []MediaInfo
-	// 提取系统提示词
 	systemPrompt := extractSystemPrompt(req.Messages)
 	if needsConversationContext(req.Messages) {
 		// 多轮对话：拼接所有消息（包含system）
@@ -1952,10 +2343,41 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		}
 	}()
 
+	// 估算输入 tokens（基于文本长度）
+	statsInputTokens = int64(len(textContent)/4) + int64(len(images)*500) // 文本 + 图片估算
+
+	// 流式请求：提前发送 SSE 头部，避免上游请求期间客户端等待超时
+	var streamWriter http.ResponseWriter
+	var streamFlusher http.Flusher
+	var streamStarted bool
+	if req.Stream {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+		streamWriter = c.Writer
+		streamFlusher, _ = streamWriter.(http.Flusher)
+		chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"role": "assistant"}, nil)
+		fmt.Fprintf(streamWriter, "data: %s\n\n", chunk)
+		streamFlusher.Flush()
+		streamStarted = true
+	}
+
 	for retry := 0; retry < maxRetries; retry++ {
 		acc := pool.Pool.Next()
 		if acc == nil {
-			c.JSON(500, gin.H{"error": "没有可用账号"})
+			if streamStarted {
+				// 流式请求已开始，发送 SSE 格式错误
+				errChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": "[错误] 没有可用账号"}, nil)
+				fmt.Fprintf(streamWriter, "data: %s\n\n", errChunk)
+				finishReason := "stop"
+				finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
+				fmt.Fprintf(streamWriter, "data: %s\n\n", finalChunk)
+				fmt.Fprintf(streamWriter, "data: [DONE]\n\n")
+				streamFlusher.Flush()
+			} else {
+				c.JSON(500, gin.H{"error": "没有可用账号"})
+			}
 			return
 		}
 		usedAcc = acc
@@ -2035,12 +2457,17 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if textContent != "" {
 			queryParts = append(queryParts, map[string]interface{}{"text": textContent})
 		}
-
-		// 检查模型类型后缀
-		isImageModel := strings.HasSuffix(req.Model, "-image")
-		isVideoModel := strings.HasSuffix(req.Model, "-video")
-		isSearchModel := strings.HasSuffix(req.Model, "-search")
-		actualModel := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(req.Model, "-image"), "-video"), "-search")
+		// 确保 queryParts 不为空，避免 Google 返回空响应
+		if len(queryParts) == 0 {
+			queryParts = append(queryParts, map[string]interface{}{"text": " "})
+		}
+		isImageModel := strings.Contains(req.Model, "-image")
+		isVideoModel := strings.Contains(req.Model, "-video")
+		isSearchModel := strings.Contains(req.Model, "-search")
+		actualModel := req.Model
+		actualModel = strings.ReplaceAll(actualModel, "-image", "")
+		actualModel = strings.ReplaceAll(actualModel, "-video", "")
+		actualModel = strings.ReplaceAll(actualModel, "-search", "")
 
 		// 构建 toolsSpec（支持自定义工具）
 		toolsSpec := buildToolsSpec(req.Tools, isImageModel, isVideoModel, isSearchModel)
@@ -2142,18 +2569,34 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		hasInlineData := bytes.Contains(respBody, []byte(`"inlineData"`))
 		hasThought := bytes.Contains(respBody, []byte(`"thought"`))
 		hasFunctionCall := bytes.Contains(respBody, []byte(`"functionCall"`))
+		hasError := bytes.Contains(respBody, []byte(`"error"`)) || bytes.Contains(respBody, []byte(`"errorMessage"`))
 		hasContent := hasText || hasFile || hasInlineData || hasFunctionCall
+
+		// 检测是否有服务端错误信息
+		if hasError && !hasContent {
+			logger.Warn("[%s] 响应包含错误信息，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+			// 简单解析错误类型
+			if bytes.Contains(respBody, []byte("RESOURCE_EXHAUSTED")) || bytes.Contains(respBody, []byte("quota")) {
+				logger.Info("⏳ [%s] 检测到配额耗尽，标记冷却", acc.Data.Email)
+				acc.SetCooldownMultiplier(5) // 5倍冷却
+				pool.Pool.MarkUsed(acc, false)
+			}
+			lastErr = fmt.Errorf("上游返回错误响应")
+			continue
+		}
 
 		// 响应完全为空或只有思考内容
 		if !hasContent {
 			if hasThought {
-				logger.Warn("[%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+				logger.Warn("[%s] 响应只有思考内容，无实际输出，换号重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
 				lastErr = fmt.Errorf("空返回，只有思考内容")
+				// 思考中的账号不标记失败，可能只是请求太慢
+				time.Sleep(500 * time.Millisecond)
 			} else {
-				logger.Warn("[%s] 响应无有效内容 (text/file/inlineData/functionCall)，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+				logger.Warn("[%s] 响应无有效内容 (text/file/inlineData/functionCall)，换号重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
 				lastErr = fmt.Errorf("空返回，无有效内容")
+				pool.Pool.MarkUsed(acc, false)
 			}
-			pool.Pool.MarkUsed(acc, false)
 			continue
 		}
 
@@ -2169,8 +2612,18 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 	if lastErr != nil {
 		logger.Error("❌ 所有重试均失败: %v", lastErr)
-		// 如果有 HTTP 错误响应体，原样透传
-		if lastErrStatusCode > 0 && len(lastErrBody) > 0 {
+		if streamStarted {
+			// 流式请求已开始，发送 SSE 格式错误
+			errMsg := fmt.Sprintf("[错误] %v", lastErr)
+			errChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": errMsg}, nil)
+			fmt.Fprintf(streamWriter, "data: %s\n\n", errChunk)
+			finishReason := "stop"
+			finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
+			fmt.Fprintf(streamWriter, "data: %s\n\n", finalChunk)
+			fmt.Fprintf(streamWriter, "data: [DONE]\n\n")
+			streamFlusher.Flush()
+		} else if lastErrStatusCode > 0 && len(lastErrBody) > 0 {
+			// 如果有 HTTP 错误响应体，原样透传
 			c.Data(lastErrStatusCode, "application/json", lastErrBody)
 		} else {
 			c.JSON(500, gin.H{"error": lastErr.Error()})
@@ -2183,7 +2636,17 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	// 检查空响应
 	if len(respBody) == 0 {
 		logger.Error("❌ 响应为空")
-		c.JSON(500, gin.H{"error": "Empty response from Google"})
+		if streamStarted {
+			errChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": "[错误] 上游返回空响应"}, nil)
+			fmt.Fprintf(streamWriter, "data: %s\n\n", errChunk)
+			finishReason := "stop"
+			finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
+			fmt.Fprintf(streamWriter, "data: %s\n\n", finalChunk)
+			fmt.Fprintf(streamWriter, "data: [DONE]\n\n")
+			streamFlusher.Flush()
+		} else {
+			c.JSON(500, gin.H{"error": "Empty response from Google"})
+		}
 		return
 	}
 
@@ -2212,7 +2675,17 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			} else {
 				logger.Error("❌ 所有解析方式均失败, 响应长度: %d, 完整响应: %s", len(respBody), respStr)
 			}
-			c.JSON(500, gin.H{"error": "JSON Parse Error"})
+			if streamStarted {
+				errChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": "[错误] 响应解析失败"}, nil)
+				fmt.Fprintf(streamWriter, "data: %s\n\n", errChunk)
+				finishReason := "stop"
+				finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
+				fmt.Fprintf(streamWriter, "data: %s\n\n", finalChunk)
+				fmt.Fprintf(streamWriter, "data: [DONE]\n\n")
+				streamFlusher.Flush()
+			} else {
+				c.JSON(500, gin.H{"error": "JSON Parse Error"})
+			}
 			return
 		}
 		logger.Info("✅ 备用解析成功，共 %d 个对象", len(dataList))
@@ -2281,17 +2754,12 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 	if req.Stream {
 		// 流式响应：文本/思考实时输出，图片最后处理
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
+		// SSE 头部和 role chunk 已在请求前发送，复用 streamWriter/streamFlusher
+		writer := streamWriter
+		flusher := streamFlusher
 
-		writer := c.Writer
-		flusher, _ := writer.(http.Flusher)
-
-		// 发送 role
-		chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"role": "assistant"}, nil)
-		fmt.Fprintf(writer, "data: %s\n\n", chunk)
-		flusher.Flush()
+		// 统计输出内容长度
+		var outputLen int64
 
 		// 收集待下载的文件和工具调用
 		var pendingFiles []PendingFile
@@ -2328,6 +2796,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 						chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"reasoning_content": t}, nil)
 						fmt.Fprintf(writer, "data: %s\n\n", chunk)
 						flusher.Flush()
+						outputLen += int64(len(t))
 					}
 					continue
 				}
@@ -2336,6 +2805,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": t}, nil)
 					fmt.Fprintf(writer, "data: %s\n\n", chunk)
 					flusher.Flush()
+					outputLen += int64(len(t))
 				}
 
 				// 处理 inlineData（直接有 base64 数据的图片）
@@ -2418,10 +2888,15 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			// 按顺序输出
 			successCount := 0
 			var lastErr error
+			needsRetry := false
 			for i, r := range downloaded {
 				if r.Err != nil {
 					logger.Error("❌ 下载文件[%d]失败: %v", i, r.Err)
 					lastErr = r.Err
+					// 检测是否需要换号重试
+					if errors.Is(r.Err, ErrDownloadNeedsRetry) {
+						needsRetry = true
+					}
 					continue
 				}
 				imgMarkdown := formatImageAsMarkdown(r.MimeType, r.Data)
@@ -2431,9 +2906,16 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				successCount++
 			}
 
-			// 如果所有文件都下载失败，发送错误提示
+			// 如果所有文件都下载失败
 			if successCount == 0 && lastErr != nil {
-				errMsg := fmt.Sprintf("生成的文件下载失败: %v", lastErr)
+				var errMsg string
+				if needsRetry {
+					// 401/403 认证失败，提示用户重试（下次会使用新账号）
+					errMsg = "[提示] 文件下载认证失败，请重新发送请求（系统将自动切换账号）"
+					pool.Pool.MarkNeedsRefresh(usedAcc) // 标记当前账号需要刷新
+				} else {
+					errMsg = fmt.Sprintf("生成的文件下载失败: %v", lastErr)
+				}
 				chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": errMsg}, nil)
 				fmt.Fprintf(writer, "data: %s\n\n", chunk)
 				flusher.Flush()
@@ -2452,6 +2934,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 		// 更新统计（区分图片和视频）
 		statsSuccess = true
+		statsOutputTokens = outputLen / 4 // 估算输出 tokens
 		for _, pf := range pendingFiles {
 			if strings.HasPrefix(pf.MimeType, "video/") {
 				statsVideos++
@@ -2499,7 +2982,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					}
 				}
 
-				text, imageData, imageMime, reasoning := extractContentFromReply(replyMap, usedJWT, respSession, usedConfigID, usedOrigAuth)
+				text, imageData, imageMime, reasoning, dlErr := extractContentFromReply(replyMap, usedJWT, respSession, usedConfigID, usedOrigAuth)
 				if reasoning != "" {
 					fullReasoning.WriteString(reasoning)
 				}
@@ -2508,6 +2991,11 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				}
 				if imageData != "" && imageMime != "" {
 					fullContent.WriteString(formatImageAsMarkdown(imageMime, imageData))
+				}
+				// 检测下载是否需要重试（401/403）
+				if dlErr != nil && errors.Is(dlErr, ErrDownloadNeedsRetry) {
+					pool.Pool.MarkNeedsRefresh(usedAcc)
+					fullContent.WriteString("\n\n[提示] 文件下载认证失败，请重新发送请求（系统将自动切换账号）")
 				}
 			}
 		}
@@ -2567,7 +3055,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 }
 func apiKeyAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if len(appConfig.APIKeys) == 0 {
+		// 使用线程安全的方式获取 API Keys
+		apiKeys := GetAPIKeys()
+		if len(apiKeys) == 0 {
 			c.Next()
 			return
 		}
@@ -2588,7 +3078,7 @@ func apiKeyAuth() gin.HandlerFunc {
 
 		// 验证 API Key
 		valid := false
-		for _, key := range appConfig.APIKeys {
+		for _, key := range apiKeys {
 			if key == apiKey {
 				valid = true
 				break
@@ -2884,6 +3374,12 @@ func runAsServer() {
 	if err := pool.Pool.Load(dataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
+
+	// 启动配置文件热重载监听
+	if err := startConfigWatcher(); err != nil {
+		logger.Warn("⚠️ 配置热重载启动失败: %v", err)
+	}
+
 	poolServer = pool.NewPoolServer(pool.Pool, appConfig.PoolServer)
 	poolServer.StartBackground() // 启动后台任务分发和心跳检测
 	pool.Pool.StartPoolManager()
@@ -3149,6 +3645,9 @@ func setupAPIRoutes(r *gin.Engine) {
 		detailed["proxy_pool"] = proxy.Manager.PoolStats()
 		c.JSON(200, detailed)
 	})
+	admin.GET("/ip", func(c *gin.Context) {
+		c.JSON(200, ipStats.GetAllIPStats())
+	})
 
 	admin.POST("/force-refresh", func(c *gin.Context) {
 		count := pool.Pool.ForceRefreshAll()
@@ -3156,6 +3655,28 @@ func setupAPIRoutes(r *gin.Engine) {
 			"message": "已触发强制刷新",
 			"count":   count,
 		})
+	})
+	admin.POST("/reload-config", func(c *gin.Context) {
+		if err := reloadConfig(); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		configMu.RLock()
+		c.JSON(200, gin.H{
+			"message":  "配置已重载",
+			"api_keys": len(appConfig.APIKeys),
+			"debug":    appConfig.Debug,
+			"pool_config": gin.H{
+				"refresh_cooldown_sec":      appConfig.Pool.RefreshCooldownSec,
+				"use_cooldown_sec":          appConfig.Pool.UseCooldownSec,
+				"max_fail_count":            appConfig.Pool.MaxFailCount,
+				"enable_browser_refresh":    appConfig.Pool.EnableBrowserRefresh,
+				"browser_refresh_headless":  appConfig.Pool.BrowserRefreshHeadless,
+				"browser_refresh_max_retry": appConfig.Pool.BrowserRefreshMaxRetry,
+				"auto_delete_401":           appConfig.Pool.AutoDelete401,
+			},
+		})
+		configMu.RUnlock()
 	})
 
 	admin.POST("/config/cooldown", func(c *gin.Context) {
@@ -3361,6 +3882,11 @@ func runLocalMode() {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
 
+	// 启动配置文件热重载监听
+	if err := startConfigWatcher(); err != nil {
+		logger.Warn("⚠️ 配置热重载启动失败: %v", err)
+	}
+
 	// 代理实例池由异步健康检查完成后初始化
 
 	// 检查 CONFIG_ID
@@ -3369,7 +3895,7 @@ func runLocalMode() {
 	}
 
 	// 检查 API Key 配置
-	if len(appConfig.APIKeys) == 0 {
+	if len(GetAPIKeys()) == 0 {
 		logger.Warn("⚠️ 未配置 API Key，API 将无鉴权运行")
 	}
 

@@ -8,8 +8,10 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +24,6 @@ import (
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
-	"github.com/go-rod/stealth"
 )
 
 var (
@@ -179,7 +180,6 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 	return email, nil
 }
 func getEmailCount(email string) int {
-	// 重试3次
 	for retry := 0; retry < 3; retry++ {
 		req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
@@ -399,48 +399,135 @@ var browserEnvVars = []string{
 	"CHROMIUM_BIN",
 }
 
-// 系统浏览器路径列表（按优先级排序）
-var systemBrowserPaths = []string{
-	"/usr/bin/google-chrome",
-	"/usr/bin/google-chrome-stable",
-	"/usr/bin/google-chrome-beta",
-	"/usr/bin/google-chrome-unstable",
-	"/opt/google/chrome/chrome",
-	"/opt/google/chrome/google-chrome",
-	"/usr/bin/chromium",
-	"/usr/bin/chromium-browser",
-	"/usr/lib/chromium/chromium",
-	"/usr/lib/chromium-browser/chromium-browser",
-	"/snap/bin/chromium",
-	"/snap/chromium/current/usr/lib/chromium-browser/chrome",
-	"/usr/bin/microsoft-edge",
-	"/usr/bin/microsoft-edge-stable",
-	"/usr/bin/microsoft-edge-beta",
-	"/usr/bin/microsoft-edge-dev",
-	"/opt/microsoft/msedge/msedge",
-	"/usr/bin/chromium-browser",
-	"/usr/lib/chromium/chromium",
-	"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-	"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-	"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-	"%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe",
-	"%LOCALAPPDATA%\\Microsoft\\Edge\\Application\\msedge.exe",
-	"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-	"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-	"/Applications/Chromium.app/Contents/MacOS/Chromium",
-	"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-	"/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
-	"/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+// getWindowsBrowserPaths 获取 Windows 浏览器路径列表
+func getWindowsBrowserPaths() []string {
+	paths := []string{}
+
+	// 程序安装目录
+	programFiles := os.Getenv("ProgramFiles")
+	programFilesX86 := os.Getenv("ProgramFiles(x86)")
+	localAppData := os.Getenv("LOCALAPPDATA")
+	userProfile := os.Getenv("USERPROFILE")
+
+	// Chrome 路径
+	chromePaths := []string{
+		filepath.Join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(userProfile, "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
+	}
+	paths = append(paths, chromePaths...)
+
+	// Edge 路径
+	edgePaths := []string{
+		filepath.Join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+		filepath.Join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+		filepath.Join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe"),
+	}
+	paths = append(paths, edgePaths...)
+
+	// Brave 路径
+	bravePaths := []string{
+		filepath.Join(programFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		filepath.Join(programFilesX86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		filepath.Join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+	}
+	paths = append(paths, bravePaths...)
+
+	// Vivaldi 路径
+	vivaldiPaths := []string{
+		filepath.Join(localAppData, "Vivaldi", "Application", "vivaldi.exe"),
+	}
+	paths = append(paths, vivaldiPaths...)
+
+	// Opera 路径
+	operaPaths := []string{
+		filepath.Join(localAppData, "Programs", "Opera", "opera.exe"),
+		filepath.Join(localAppData, "Programs", "Opera GX", "opera.exe"),
+	}
+	paths = append(paths, operaPaths...)
+
+	return paths
 }
 
-// findBrowser 查找可用浏览器（优先环境变量，然后系统路径）
+// getLinuxBrowserPaths 获取 Linux 浏览器路径列表
+func getLinuxBrowserPaths() []string {
+	return []string{
+		// Chrome
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+		"/usr/bin/google-chrome-beta",
+		"/usr/bin/google-chrome-unstable",
+		"/opt/google/chrome/chrome",
+		"/opt/google/chrome/google-chrome",
+		// Chromium
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/usr/lib/chromium/chromium",
+		"/usr/lib/chromium-browser/chromium-browser",
+		"/snap/bin/chromium",
+		"/snap/chromium/current/usr/lib/chromium-browser/chrome",
+		// Edge
+		"/usr/bin/microsoft-edge",
+		"/usr/bin/microsoft-edge-stable",
+		"/usr/bin/microsoft-edge-beta",
+		"/usr/bin/microsoft-edge-dev",
+		"/opt/microsoft/msedge/msedge",
+		// Brave
+		"/usr/bin/brave-browser",
+		"/usr/bin/brave-browser-stable",
+		"/opt/brave.com/brave/brave-browser",
+		// Vivaldi
+		"/usr/bin/vivaldi",
+		"/usr/bin/vivaldi-stable",
+		// Opera
+		"/usr/bin/opera",
+	}
+}
+
+// getMacOSBrowserPaths 获取 macOS 浏览器路径列表
+func getMacOSBrowserPaths() []string {
+	homeDir, _ := os.UserHomeDir()
+	paths := []string{
+		// Chrome
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+		filepath.Join(homeDir, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+		// Chromium
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		// Edge
+		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		"/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
+		"/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+		// Brave
+		"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+		// Vivaldi
+		"/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",
+		// Opera
+		"/Applications/Opera.app/Contents/MacOS/Opera",
+	}
+	return paths
+}
+
+// getBrowserPathsForOS 根据操作系统获取浏览器路径列表
+func getBrowserPathsForOS() []string {
+	switch runtime.GOOS {
+	case "windows":
+		return getWindowsBrowserPaths()
+	case "darwin":
+		return getMacOSBrowserPaths()
+	default: // linux, freebsd, etc.
+		return getLinuxBrowserPaths()
+	}
+}
+
+// findBrowser 查找可用浏览器（完整兼容 Windows/Linux/macOS）
 func findBrowser() (string, bool) {
 	// 1. 优先检查环境变量
 	for _, envVar := range browserEnvVars {
 		if path := os.Getenv(envVar); path != "" {
-			// 扩展 Windows 环境变量
-			path = os.ExpandEnv(path)
+			// 扩展环境变量
+			path = expandPath(path)
 			if _, err := os.Stat(path); err == nil {
 				log.Printf("🌐 从环境变量 %s 获取浏览器: %s", envVar, path)
 				return path, true
@@ -448,18 +535,26 @@ func findBrowser() (string, bool) {
 		}
 	}
 
-	// 2. 检查系统路径
-	for _, path := range systemBrowserPaths {
-		// 扩展 Windows 环境变量（如 %LOCALAPPDATA%）
-		expandedPath := os.ExpandEnv(path)
-		if _, err := os.Stat(expandedPath); err == nil {
-			return expandedPath, true
+	// 2. 检查系统路径（根据操作系统）
+	for _, path := range getBrowserPathsForOS() {
+		expandedPath := expandPath(path)
+		if expandedPath != "" {
+			if _, err := os.Stat(expandedPath); err == nil {
+				log.Printf("🌐 找到浏览器: %s", expandedPath)
+				return expandedPath, true
+			}
 		}
 	}
 
-	// 3. 尝试通过 PATH 查找
-	pathBrowsers := []string{"google-chrome", "chromium", "chromium-browser", "microsoft-edge", "chrome", "msedge"}
-	for _, name := range pathBrowsers {
+	// 3. 尝试通过 which/where 命令查找
+	if path := findBrowserByCommand(); path != "" {
+		log.Printf("🌐 通过系统命令找到浏览器: %s", path)
+		return path, true
+	}
+
+	// 4. 尝试通过 PATH 手动查找
+	browserNames := getBrowserNamesForOS()
+	for _, name := range browserNames {
 		if path, err := findInPath(name); err == nil && path != "" {
 			log.Printf("🌐 从 PATH 找到浏览器: %s", path)
 			return path, true
@@ -469,26 +564,98 @@ func findBrowser() (string, bool) {
 	return "", false
 }
 
+// expandPath 扩展路径中的环境变量
+func expandPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	// 扩展 $VAR 和 ${VAR} 格式
+	expanded := os.ExpandEnv(path)
+	// Windows 特殊处理: 扩展 %VAR% 格式
+	if runtime.GOOS == "windows" && strings.Contains(expanded, "%") {
+		for _, env := range os.Environ() {
+			parts := strings.SplitN(env, "=", 2)
+			if len(parts) == 2 {
+				expanded = strings.ReplaceAll(expanded, "%"+parts[0]+"%", parts[1])
+			}
+		}
+	}
+	return expanded
+}
+
+// getBrowserNamesForOS 获取当前操作系统的浏览器可执行文件名
+func getBrowserNamesForOS() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"chrome", "msedge", "brave", "vivaldi", "opera"}
+	}
+	return []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser", "vivaldi"}
+}
+
+// findBrowserByCommand 通过系统命令查找浏览器
+func findBrowserByCommand() string {
+	var cmd *exec.Cmd
+	var browsers []string
+
+	if runtime.GOOS == "windows" {
+		// Windows 使用 where 命令
+		browsers = []string{"chrome.exe", "msedge.exe", "brave.exe"}
+		for _, browser := range browsers {
+			cmd = exec.Command("where", browser)
+			if output, err := cmd.Output(); err == nil {
+				lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+				if len(lines) > 0 && lines[0] != "" {
+					return strings.TrimSpace(lines[0])
+				}
+			}
+		}
+	} else {
+		// Unix 使用 which 命令
+		browsers = []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"}
+		for _, browser := range browsers {
+			cmd = exec.Command("which", browser)
+			if output, err := cmd.Output(); err == nil {
+				path := strings.TrimSpace(string(output))
+				if path != "" {
+					return path
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // findInPath 在 PATH 中查找可执行文件
 func findInPath(name string) (string, error) {
 	pathEnv := os.Getenv("PATH")
 	var separator string
-	if strings.Contains(pathEnv, ";") {
-		separator = ";" // Windows
+	if runtime.GOOS == "windows" {
+		separator = ";"
 	} else {
-		separator = ":" // Unix
+		separator = ":"
 	}
 
 	for _, dir := range strings.Split(pathEnv, separator) {
 		if dir == "" {
 			continue
 		}
-		// 在 Windows 上添加 .exe 后缀
-		paths := []string{
-			filepath.Join(dir, name),
-			filepath.Join(dir, name+".exe"),
+		dir = expandPath(dir)
+
+		// 根据操作系统构建候选路径
+		var candidates []string
+		if runtime.GOOS == "windows" {
+			candidates = []string{
+				filepath.Join(dir, name+".exe"),
+				filepath.Join(dir, name+".cmd"),
+				filepath.Join(dir, name+".bat"),
+				filepath.Join(dir, name),
+			}
+		} else {
+			candidates = []string{
+				filepath.Join(dir, name),
+			}
 		}
-		for _, path := range paths {
+
+		for _, path := range candidates {
 			if info, err := os.Stat(path); err == nil && !info.IsDir() {
 				return path, nil
 			}
@@ -519,33 +686,9 @@ func createBrowserSession(headless bool, proxy string, logPrefix string) (*Brows
 	} else {
 		log.Printf("%s ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", logPrefix)
 	}
-	l = l.Headless(headless).
-		Set("incognito").
-		Set("no-sandbox").
-		Set("disable-setuid-sandbox").
-		Set("disable-dev-shm-usage").
-		Set("disable-gpu").
-		Set("disable-software-rasterizer").
-		Set("disable-blink-features", "AutomationControlled").
-		Set("excludeSwitches", "enable-automation").
-		Set("useAutomationExtension", "false").
-		Set("disable-infobars").
-		Set("disable-automation").
-		Delete("enable-automation").
-		Set("window-size", "1280,800").
-		Set("lang", "zh-CN").
-		Set("disable-extensions").
-		Set("disable-background-networking").
-		Set("disable-sync").
-		Set("disable-translate").
-		Set("disable-default-apps").
-		Set("no-first-run").
-		Set("disable-background-timer-throttling").
-		Set("disable-renderer-backgrounding").
-		Set("disable-backgrounding-occluded-windows")
-	if proxy != "" {
-		l = l.Proxy(proxy)
-	}
+
+	// 配置浏览器启动参数 - 原生反检测，不依赖JS注入
+	l = configureBrowserLauncher(l, headless, proxy)
 
 	launcherURL, err := l.Launch()
 	if err != nil {
@@ -560,34 +703,78 @@ func createBrowserSession(headless bool, proxy string, logPrefix string) (*Brows
 		return nil, fmt.Errorf("连接浏览器失败: %w", err)
 	}
 	session.Browser = browser.Timeout(120 * time.Second)
-	page, err := stealth.Page(session.Browser)
+	page, err := session.Browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		session.Close()
-		return nil, fmt.Errorf("创建 stealth 页面失败: %w", err)
+		return nil, fmt.Errorf("创建页面失败: %w", err)
 	}
 	session.Page = page
 
-	// 设置视口
-	page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{Width: 1280, Height: 800})
-	page.Eval(`() => {
-		Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-		if (window.chrome) { window.chrome.runtime = undefined; }
-		const originalQuery = window.navigator.permissions.query;
-		window.navigator.permissions.query = (parameters) => (
-			parameters.name === 'notifications' ?
-				Promise.resolve({ state: Notification.permission }) :
-				originalQuery(parameters)
-		);
-		Object.defineProperty(navigator, 'plugins', {
-			get: () => [
-				{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-				{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-				{ name: 'Native Client', filename: 'internal-nacl-plugin' }
-			]
-		});
-		Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-	}`)
+	// 设置视口（使用常见分辨率）
+	page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
+		Width:  1920,
+		Height: 1080,
+	})
+
 	return session, nil
+}
+
+// configureBrowserLauncher 配置浏览器启动参数（原生反检测，无需JS注入）
+func configureBrowserLauncher(l *launcher.Launcher, headless bool, proxy string) *launcher.Launcher {
+	// 基础参数
+	l = l.Set("no-sandbox").
+		Set("disable-setuid-sandbox").
+		Set("disable-dev-shm-usage").
+		Set("disable-gpu").
+		Set("no-first-run").
+		Set("no-default-browser-check")
+
+	// 核心反检测参数 - 通过启动参数原生禁用自动化标志
+	l = l.Set("disable-blink-features", "AutomationControlled").
+		Delete("enable-automation"). // 删除自动化标志
+		Set("disable-features", "TranslateUI,AutofillServerCommunication").
+		Set("disable-ipc-flooding-protection")
+
+	// 窗口和显示参数
+	l = l.Set("window-size", "1920,1080").
+		Set("start-maximized").
+		Set("lang", "zh-CN,zh,en-US,en")
+
+	// 禁用可能暴露自动化的功能
+	l = l.Set("disable-extensions").
+		Set("disable-component-extensions-with-background-pages").
+		Set("disable-background-networking").
+		Set("disable-sync").
+		Set("disable-default-apps").
+		Set("disable-infobars").
+		Set("disable-hang-monitor").
+		Set("disable-popup-blocking").
+		Set("disable-prompt-on-repost").
+		Set("disable-client-side-phishing-detection").
+		Set("disable-background-timer-throttling").
+		Set("disable-renderer-backgrounding").
+		Set("disable-backgrounding-occluded-windows")
+
+	// 性能相关参数
+	l = l.Set("metrics-recording-only").
+		Set("safebrowsing-disable-auto-update")
+
+	// Headless 模式配置
+	if headless {
+		// 使用新版 headless 模式（Chrome 112+），更接近真实浏览器
+		// 旧的 --headless 模式容易被检测
+		l = l.Headless(false). // 不使用 rod 的 headless
+					Set("headless", "new") // 使用 Chrome 的新 headless 模式
+	} else {
+		l = l.Headless(false)
+	}
+
+	// 代理配置
+	if proxy != "" {
+		l = l.Proxy(proxy)
+	}
+
+	return l
 }
 
 // SetupNetworkCapture 设置网络捕获（监听 authorization/configID/csesidx）
@@ -996,27 +1183,8 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
 	}
 
-	// 设置启动参数（兼容更多环境 + 反自动化检测）
-	l = l.Headless(headless).
-		Set("no-sandbox").
-		Set("disable-setuid-sandbox").
-		Set("disable-dev-shm-usage").
-		Set("disable-gpu").
-		Set("disable-software-rasterizer").
-		Set("disable-blink-features", "AutomationControlled").
-		Set("window-size", "1280,800").
-		Set("lang", "zh-CN").
-		Set("disable-extensions").
-		// 额外的反检测参数
-		Set("excludeSwitches", "enable-automation").
-		Set("useAutomationExtension", "false").
-		Set("disable-infobars").
-		Set("disable-automation").
-		Delete("enable-automation")
-
-	if proxy != "" {
-		l = l.Proxy(proxy)
-	}
+	// 使用统一的浏览器配置（原生反检测，无需JS注入）
+	l = configureBrowserLauncher(l, headless, proxy)
 
 	launcherURL, err := l.Launch()
 	if err != nil {
@@ -1041,55 +1209,20 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	browser = browser.Timeout(120 * time.Second)
 
-	// 使用 stealth 创建页面（绕过自动化检测）
-	page, err := stealth.Page(browser)
+	// 直接创建页面，不使用 stealth 注入（依赖启动参数实现反检测）
+	page, err := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
-		result.Error = fmt.Errorf("创建 stealth 页面失败: %w", err)
+		result.Error = fmt.Errorf("创建页面失败: %w", err)
 		return result
 	}
 
-	// 设置视口
+	// 设置视口（使用常见分辨率）
 	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
-		Width:  1280,
-		Height: 800,
+		Width:  1920,
+		Height: 1080,
 	}); err != nil {
 		log.Printf("[注册 %d] ⚠️ 设置视口失败: %v", threadID, err)
 	}
-
-	// 注入额外的反检测脚本
-	_, _ = page.Eval(`() => {
-		// 覆盖 navigator.webdriver
-		Object.defineProperty(navigator, 'webdriver', {
-			get: () => undefined
-		});
-		
-		// 覆盖 chrome 自动化标识
-		if (window.chrome) {
-			window.chrome.runtime = undefined;
-		}
-		
-		// 覆盖 permissions
-		const originalQuery = window.navigator.permissions.query;
-		window.navigator.permissions.query = (parameters) => (
-			parameters.name === 'notifications' ?
-				Promise.resolve({ state: Notification.permission }) :
-				originalQuery(parameters)
-		);
-		
-		// 模拟真实的 plugins
-		Object.defineProperty(navigator, 'plugins', {
-			get: () => [
-				{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-				{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-				{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-			]
-		});
-		
-		// 模拟真实的 languages
-		Object.defineProperty(navigator, 'languages', {
-			get: () => ['zh-CN', 'zh', 'en-US', 'en']
-		});
-	}`)
 
 	// 监听请求以捕获 authorization
 	var authorization string
